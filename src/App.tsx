@@ -1,9 +1,12 @@
-import {
+﻿import {
   startTransition,
   useDeferredValue,
+  useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
+import type { CSSProperties, ImgHTMLAttributes } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
@@ -11,6 +14,7 @@ import "./App.css";
 import {
   applyDecision,
   cancelScan,
+  listRatedPhotos,
   loadActions,
   loadGroup,
   loadGroups,
@@ -18,7 +22,9 @@ import {
   loadScanStatus,
   loadSnapshot,
   loadUnknownFormats,
+  setRating,
   startScan,
+  undoRating,
 } from "./api";
 import type {
   GroupDetail,
@@ -27,6 +33,8 @@ import type {
   GroupSummary,
   MatchKind,
   PathHistoryItem,
+  RatedPhoto,
+  RatingPhotoFilter,
   ReviewActionSummary,
   ReviewStatus,
   ScanActiveItem,
@@ -36,7 +44,7 @@ import type {
   UnknownFormatSummary,
 } from "./types";
 
-type AppTab = "scan" | "review" | "history";
+type AppTab = "scan" | "review" | "history" | "rating";
 
 const kindTabs: Array<{ label: string; value: MatchKind | null }> = [
   { label: "全部", value: null },
@@ -50,6 +58,89 @@ const statusTabs: Array<{ label: string; value: ReviewStatus | null }> = [
   { label: "已应用", value: "applied" },
   { label: "全部", value: null },
 ];
+
+const loadedPreviewImageSrcs = new Set<string>();
+const pendingPreviewImageLoads = new Map<string, Promise<void>>();
+
+function preloadPreviewImage(src: string): Promise<void> {
+  if (loadedPreviewImageSrcs.has(src)) {
+    return Promise.resolve();
+  }
+
+  const pending = pendingPreviewImageLoads.get(src);
+  if (pending) {
+    return pending;
+  }
+
+  const promise = new Promise<void>((resolve, reject) => {
+    const img = new Image();
+    let settled = false;
+
+    function finishLoaded() {
+      if (settled) return;
+      settled = true;
+      loadedPreviewImageSrcs.add(src);
+      pendingPreviewImageLoads.delete(src);
+      resolve();
+    }
+
+    function finishFailed() {
+      if (settled) return;
+      settled = true;
+      pendingPreviewImageLoads.delete(src);
+      reject(new Error(`Failed to preload image: ${src}`));
+    }
+
+    img.decoding = "async";
+    img.onload = () => {
+      if (typeof img.decode === "function") {
+        void img.decode().catch(() => undefined).finally(finishLoaded);
+        return;
+      }
+      finishLoaded();
+    };
+    img.onerror = finishFailed;
+    img.src = src;
+
+    if (img.complete) {
+      if (typeof img.decode === "function") {
+        void img.decode().catch(() => undefined).finally(finishLoaded);
+      } else {
+        finishLoaded();
+      }
+    }
+  });
+
+  pendingPreviewImageLoads.set(src, promise);
+  return promise;
+}
+
+function BufferedPreviewImage(
+  props: Omit<ImgHTMLAttributes<HTMLImageElement>, "src"> & { src: string },
+) {
+  const { src, ...imgProps } = props;
+  const [displaySrc, setDisplaySrc] = useState(src);
+  const resolvedSrc = loadedPreviewImageSrcs.has(src) ? src : displaySrc;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (resolvedSrc === src) return;
+
+    void preloadPreviewImage(src)
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) {
+          setDisplaySrc(src);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [resolvedSrc, src]);
+
+  return <img {...imgProps} src={resolvedSrc} />;
+}
 
 function App() {
   const [activeTab, setActiveTab] = useState<AppTab>("scan");
@@ -79,6 +170,68 @@ function App() {
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const deferredSearch = useDeferredValue(searchText);
+
+  const [ratingPhotos, setRatingPhotos] = useState<RatedPhoto[]>([]);
+  const [ratingTotal, setRatingTotal] = useState(0);
+  const [ratingPhotoIdx, setRatingPhotoIdx] = useState(0);
+  const [ratingFilter, setRatingFilter] = useState<RatingPhotoFilter>({
+    unratedOnly: false,
+    minRating: null,
+  });
+  const [ratingLoading, setRatingLoading] = useState(false);
+  const [ratings, setRatings] = useState<Map<number, number | null>>(new Map());
+  const [previewMode, setPreviewMode] = useState<"fit" | "actual">("fit");
+  const [previewScale, setPreviewScale] = useState(1);
+  const [ratingImmersive, setRatingImmersive] = useState(false);
+  const [ratingListVisible, setRatingListVisible] = useState(true);
+  const previewModeRef = useRef(previewMode);
+  previewModeRef.current = previewMode;
+  const previewScaleRef = useRef(previewScale);
+  previewScaleRef.current = previewScale;
+  const ratingPhotoIdxRef = useRef(ratingPhotoIdx);
+  ratingPhotoIdxRef.current = ratingPhotoIdx;
+  const ratingPhotosRef = useRef(ratingPhotos);
+  ratingPhotosRef.current = ratingPhotos;
+  const ratingListScrollRef = useRef<HTMLDivElement | null>(null);
+  const ratingItemRefs = useRef(new Map<number, HTMLButtonElement>());
+  const PAGE_SIZE = 500;
+
+  useEffect(() => {
+    if (activeTab !== "rating") return;
+    void loadRatingPhotoPage(ratingFilter, 0);
+  }, [activeTab, ratingFilter]);
+
+  useEffect(() => {
+    if (activeTab === "rating") return;
+    setRatingImmersive(false);
+    setRatingListVisible(true);
+    setPreviewScale(1);
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "rating" || !ratingListVisible) return;
+    const currentPhoto = ratingPhotos[ratingPhotoIdx] ?? null;
+    if (!currentPhoto) return;
+    const item = ratingItemRefs.current.get(currentPhoto.fileInstanceId);
+    item?.scrollIntoView({
+      block: "center",
+      inline: "nearest",
+      behavior: "smooth",
+    });
+  }, [activeTab, ratingListVisible, ratingPhotoIdx, ratingPhotos]);
+
+  useEffect(() => {
+    if (activeTab !== "rating" || ratingPhotos.length === 0) return;
+
+    const nearbyPhotos = ratingPhotos
+      .slice(Math.max(0, ratingPhotoIdx - 1), Math.min(ratingPhotos.length, ratingPhotoIdx + 5))
+      .filter((photo) => photo.previewSupported);
+
+    nearbyPhotos.forEach((photo) => {
+      const src = convertFileSrc(photo.path);
+      void preloadPreviewImage(src).catch(() => undefined);
+    });
+  }, [activeTab, ratingPhotoIdx, ratingPhotos]);
 
   useEffect(() => {
     void refreshDashboard();
@@ -237,7 +390,7 @@ function App() {
       setBusyLabel("正在写入决策并移动文件到回收站…");
       setError(null);
       await applyDecision(selectedGroup.id, {
-          keepIds,
+        keepIds,
         recycleIds: recycle,
         note: note.trim() || null,
       });
@@ -266,6 +419,129 @@ function App() {
     ? selectedGroup.members.length - pendingRecycleCount
     : 0;
 
+  async function loadRatingPhotoPage(filter: RatingPhotoFilter, offset: number) {
+    setRatingLoading(true);
+    try {
+      const page = await listRatedPhotos(filter, offset, PAGE_SIZE);
+      setRatingPhotos(page.photos);
+      setRatingTotal(page.total);
+      setRatingPhotoIdx(0);
+      setRatings((prev) => {
+        const next = new Map(prev);
+        page.photos.forEach((photo) => {
+          if (!next.has(photo.fileInstanceId)) {
+            next.set(photo.fileInstanceId, photo.userRating ?? null);
+          }
+        });
+        return next;
+      });
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRatingLoading(false);
+    }
+  }
+
+  function clampPreviewScale(value: number) {
+    return Math.min(3, Math.max(0.5, Number(value.toFixed(2))));
+  }
+
+  function adjustPreviewScale(delta: number) {
+    setPreviewScale((current) => clampPreviewScale(current + delta));
+  }
+
+  const handlePreviewWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    adjustPreviewScale(event.deltaY < 0 ? 0.1 : -0.1);
+  }, []);
+
+  const handleRatingKey = useCallback((key: string) => {
+    const photos = ratingPhotosRef.current;
+    const idx = ratingPhotoIdxRef.current;
+    const currentPhoto = photos[idx];
+
+    if (key >= "0" && key <= "5") {
+      const ratingVal = parseInt(key, 10);
+      if (!currentPhoto) return;
+      const fileInstanceId = currentPhoto.fileInstanceId;
+      setRatings((prev) => new Map(prev).set(fileInstanceId, ratingVal));
+      void setRating({ fileInstanceId, rating: ratingVal }).catch(() => {
+        setRatings((prev) => new Map(prev).set(fileInstanceId, currentPhoto.userRating ?? null));
+      });
+      if (ratingVal > 0) {
+        setRatingPhotoIdx((current) => Math.min(current + 1, photos.length - 1));
+      }
+      return;
+    }
+    if (key === "ArrowRight" || key === "ArrowDown") {
+      setRatingPhotoIdx((current) => Math.min(current + 1, photos.length - 1));
+      return;
+    }
+    if (key === "ArrowLeft" || key === "ArrowUp") {
+      setRatingPhotoIdx((current) => Math.max(current - 1, 0));
+      return;
+    }
+    if (key === "u" || key === "U") {
+      void undoRating().then((restored) => {
+        if (restored) {
+          setRatings((prev) => new Map(prev).set(restored.fileInstanceId, restored.rating));
+        } else if (currentPhoto) {
+          setRatings((prev) => new Map(prev).set(currentPhoto.fileInstanceId, null));
+        }
+      });
+      return;
+    }
+    if (key === "z" || key === "Z") {
+      setPreviewMode((mode) => (mode === "fit" ? "actual" : "fit"));
+      return;
+    }
+    if (key === "+" || key === "=") {
+      setPreviewScale((current) => clampPreviewScale(current + 0.1));
+      return;
+    }
+    if (key === "-" || key === "_") {
+      setPreviewScale((current) => clampPreviewScale(current - 0.1));
+      return;
+    }
+    if (key === "Backspace") {
+      setPreviewScale(1);
+      return;
+    }
+    if (key === "f" || key === "F") {
+      setRatingImmersive((current) => {
+        const next = !current;
+        setRatingListVisible(!next);
+        return next;
+      });
+      return;
+    }
+    if (key === "l" || key === "L") {
+      setRatingListVisible((visible) => !visible);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== "rating") return;
+    function onKeyDown(event: KeyboardEvent) {
+      const tag = (event.target as HTMLElement).tagName.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      if (event.key === "Tab") {
+        event.preventDefault();
+        setRatingListVisible((visible) => !visible);
+        return;
+      }
+      if (event.key === "Escape" && ratingImmersive) {
+        event.preventDefault();
+        setRatingImmersive(false);
+        setRatingListVisible(true);
+        return;
+      }
+      handleRatingKey(event.key);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeTab, handleRatingKey, ratingImmersive]);
+
   async function waitForScanCompletion(
     onProgress: (progress: ScanProgress) => void,
   ): Promise<ScanResult> {
@@ -276,6 +552,9 @@ function App() {
       if (progress.status === "completed" && progress.result) {
         return progress.result;
       }
+      if (progress.status === "cancelled") {
+        throw new Error("__cancelled__");
+      }
       if (progress.status === "failed") {
         throw new Error(progress.error ?? "扫描失败");
       }
@@ -284,8 +563,10 @@ function App() {
     }
   }
 
+  const isRatingImmersive = activeTab === "rating" && ratingImmersive;
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${isRatingImmersive ? "app-shell--immersive" : ""}`}>
       <aside className="sidebar">
         <div className="sidebar-brand">
           <div className="brand-mark">SI</div>
@@ -296,7 +577,7 @@ function App() {
         </div>
 
         <nav className="sidebar-nav">
-          {(["scan", "review", "history"] as AppTab[]).map((tab) => (
+          {(["scan", "review", "rating", "history"] as AppTab[]).map((tab) => (
             <button
               key={tab}
               className={`nav-item ${activeTab === tab ? "nav-item--active" : ""}`}
@@ -325,9 +606,10 @@ function App() {
         </div>
       </aside>
 
-      <main className="main-area">
+      <main className={`main-area ${isRatingImmersive ? "main-area--immersive" : ""}`}>
         {activeTab === "scan" && renderScanTab()}
         {activeTab === "review" && renderReviewTab()}
+        {activeTab === "rating" && renderRatingTab()}
         {activeTab === "history" && renderHistoryTab()}
       </main>
 
@@ -759,6 +1041,339 @@ function App() {
 
   // ─── History Tab ─────────────────────────────────────────────────────────────
 
+  function renderRatingTab() {
+    const currentPhoto = ratingPhotos[ratingPhotoIdx] ?? null;
+    const filename = currentPhoto
+      ? currentPhoto.path.split(/[\\/]/).pop() ?? currentPhoto.path
+      : null;
+    const prevPhoto = ratingPhotoIdx > 0 ? ratingPhotos[ratingPhotoIdx - 1] : null;
+    const nextPhoto = ratingPhotoIdx < ratingPhotos.length - 1
+      ? ratingPhotos[ratingPhotoIdx + 1]
+      : null;
+
+    function getPhotoRating(fid: number): number | null {
+      if (ratings.has(fid)) return ratings.get(fid) ?? null;
+      return ratingPhotos.find((photo) => photo.fileInstanceId === fid)?.userRating ?? null;
+    }
+
+    const currentRating = currentPhoto ? getPhotoRating(currentPhoto.fileInstanceId) : null;
+    const comparePhoto = nextPhoto ?? prevPhoto ?? null;
+    const showDualPortraitCompare = Boolean(
+      previewMode === "fit"
+      && currentPhoto
+      && currentPhoto.width
+      && currentPhoto.height
+      && currentPhoto.height > currentPhoto.width
+      && comparePhoto,
+    );
+    const comparePhotoId = showDualPortraitCompare ? comparePhoto?.fileInstanceId ?? null : null;
+
+    const filterChips: Array<{ label: string; filter: RatingPhotoFilter }> = [
+      { label: "全部", filter: { unratedOnly: false, minRating: null } },
+      { label: "未评分", filter: { unratedOnly: true, minRating: null } },
+      { label: "★3+", filter: { unratedOnly: false, minRating: 3 } },
+      { label: "★5", filter: { unratedOnly: false, minRating: 5 } },
+    ];
+
+    function isFilterActive(filter: RatingPhotoFilter) {
+      return filter.unratedOnly === ratingFilter.unratedOnly
+        && filter.minRating === ratingFilter.minRating;
+    }
+
+    function toggleImmersiveMode() {
+      setRatingImmersive((current) => {
+        const next = !current;
+        setRatingListVisible(!next);
+        return next;
+      });
+    }
+
+    return (
+      <div className={`page rating-page ${ratingImmersive ? "rating-page--immersive" : ""}`}>
+        <div className={`rating-hint-bar ${ratingImmersive ? "rating-hint-bar--immersive" : ""}`}>
+          <span className="rating-hint"><kbd>0-5</kbd> 评分</span>
+          <span className="rating-hint"><kbd>←</kbd><kbd>→</kbd> 切换</span>
+          <span className="rating-hint"><kbd>U</kbd> 撤销</span>
+          <span className="rating-hint"><kbd>Z</kbd> 缩放</span>
+          <span className="rating-hint">滚轮缩放</span>
+          <span className="rating-hint"><kbd>+</kbd><kbd>-</kbd> 缩放比</span>
+          <span className="rating-hint"><kbd>F</kbd> Immersive</span>
+          <span className="rating-hint"><kbd>Tab</kbd> List</span>
+          <div className="rating-hint-spacer" />
+          <div className="preview-mode-toggle">
+            <button
+              className={`preview-mode-btn ${previewMode === "fit" ? "preview-mode-btn--active" : ""}`}
+              onClick={() => setPreviewMode("fit")}
+              title="适合窗口 (Z)"
+            >
+              适合
+            </button>
+            <button
+              className={`preview-mode-btn ${previewMode === "actual" ? "preview-mode-btn--active" : ""}`}
+              onClick={() => setPreviewMode("actual")}
+              title="按宽边铺满"
+            >
+              1:1
+            </button>
+          </div>
+          <div className="preview-zoom-controls">
+            <button
+              className="rating-toolbar-btn"
+              onClick={() => adjustPreviewScale(-0.1)}
+              title="缩小 (-)"
+            >
+              -
+            </button>
+            <button
+              className="rating-toolbar-btn rating-toolbar-btn--active"
+              onClick={() => setPreviewScale(1)}
+              title="重置缩放 (Backspace)"
+            >
+              {Math.round(previewScale * 100)}%
+            </button>
+            <button
+              className="rating-toolbar-btn"
+              onClick={() => adjustPreviewScale(0.1)}
+              title="放大 (+)"
+            >
+              +
+            </button>
+          </div>
+          <button
+            className={`rating-toolbar-btn ${ratingListVisible ? "rating-toolbar-btn--active" : ""}`}
+            onClick={() => setRatingListVisible((visible) => !visible)}
+            title="Toggle photo list (Tab)"
+          >
+            {ratingListVisible ? "Hide List" : "Show List"}
+          </button>
+          <button
+            className={`rating-toolbar-btn ${ratingImmersive ? "rating-toolbar-btn--active" : ""}`}
+            onClick={toggleImmersiveMode}
+            title="Toggle immersive mode (F / Esc)"
+          >
+            {ratingImmersive ? "Exit Immersive" : "Immersive Mode"}
+          </button>
+          {ratingLoading && <span className="rating-loading">加载中...</span>}
+          {!ratingLoading && (
+            <span className="rating-total">
+              {ratingTotal.toLocaleString()} items
+              {ratingPhotos.length < ratingTotal && ` (showing first ${ratingPhotos.length})`}
+            </span>
+          )}
+          <button
+            className="btn btn--ghost btn--sm"
+            onClick={() => void loadRatingPhotoPage(ratingFilter, 0)}
+          >
+            刷新
+          </button>
+        </div>
+
+        <div className={`rating-layout ${ratingImmersive ? "rating-layout--immersive" : ""}`}>
+          <div className={`rating-photo-list ${!ratingListVisible ? "rating-photo-list--hidden" : ""}`}>
+            <div className="rating-filter-row">
+              {filterChips.map((chip) => (
+                <button
+                  key={chip.label}
+                  className={`chip ${isFilterActive(chip.filter) ? "chip--active" : ""}`}
+                  onClick={() => setRatingFilter(chip.filter)}
+                >
+                  {chip.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="rating-photo-scroll" ref={ratingListScrollRef}>
+              {ratingPhotos.length === 0 && !ratingLoading ? (
+                <div className="empty-state empty-state--compact">
+                  <p className="empty-state-title">
+                    {ratingTotal === 0 ? "暂无已索引照片" : "没有符合条件的照片"}
+                  </p>
+                  <p className="empty-state-body">
+                    {ratingTotal === 0
+                      ? "先扫描目录，照片会在这里显示"
+                      : "尝试切换过滤条件"}
+                  </p>
+                </div>
+              ) : (
+                ratingPhotos.map((photo, idx) => {
+                  const ratingValue = getPhotoRating(photo.fileInstanceId);
+                  const photoName = photo.path.split(/[\\/]/).pop() ?? photo.path;
+                  return (
+                    <button
+                      key={photo.fileInstanceId}
+                      ref={(node) => {
+                        if (node) {
+                          ratingItemRefs.current.set(photo.fileInstanceId, node);
+                        } else {
+                          ratingItemRefs.current.delete(photo.fileInstanceId);
+                        }
+                      }}
+                      className={`rating-photo-item ${
+                        idx === ratingPhotoIdx ? "rating-photo-item--active" : ""
+                      } ${
+                        comparePhotoId === photo.fileInstanceId ? "rating-photo-item--compare" : ""
+                      }`}
+                      onClick={() => setRatingPhotoIdx(idx)}
+                    >
+                      <div className="rating-photo-thumb">
+                        {photo.previewSupported && photo.thumbnailPath ? (
+                          <img src={convertFileSrc(photo.thumbnailPath)} alt={photoName} loading="lazy" />
+                        ) : (
+                          <div className="rating-photo-thumb-fallback">{photo.extension.toUpperCase()}</div>
+                        )}
+                      </div>
+                      <div className="rating-photo-info">
+                        <div className="rating-photo-name" title={photo.path}>{photoName}</div>
+                        <div className="rating-photo-stars">
+                          {ratingValue != null && ratingValue > 0
+                            ? "★".repeat(ratingValue) + "☆".repeat(5 - ratingValue)
+                            : "☆☆☆☆☆"}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
+          <div className={`rating-preview-area ${ratingImmersive ? "rating-preview-area--immersive" : ""}`}>
+            {currentPhoto ? (
+              <>
+                <div
+                  className={`rating-preview-img-wrap rating-preview-img-wrap--${previewMode}`}
+                  onWheel={handlePreviewWheel}
+                  style={{ ["--preview-scale" as string]: previewScale } as CSSProperties}
+                >
+                  {showDualPortraitCompare ? (
+                    <div className="rating-preview-compare">
+                      <div className="rating-preview-compare-pane">
+                        <div className="rating-preview-compare-label">当前</div>
+                        {currentPhoto.previewSupported ? (
+                          <BufferedPreviewImage
+                            className={`rating-preview-img rating-preview-img--${previewMode}`}
+                            src={convertFileSrc(currentPhoto.path)}
+                            alt={filename ?? ""}
+                          />
+                        ) : (
+                          <div className="rating-preview-fallback">
+                            <span className="preview-ext">{currentPhoto.extension.toUpperCase()}</span>
+                            <span className="preview-note">无预览</span>
+                          </div>
+                        )}
+                      </div>
+                      <div className="rating-preview-compare-pane">
+                        <div className="rating-preview-compare-label">对比</div>
+                        {comparePhoto?.previewSupported ? (
+                          <BufferedPreviewImage
+                            className={`rating-preview-img rating-preview-img--${previewMode}`}
+                            src={convertFileSrc(comparePhoto.path)}
+                            alt={comparePhoto.path.split(/[\\/]/).pop() ?? comparePhoto.path}
+                          />
+                        ) : (
+                          <div className="rating-preview-fallback">
+                            <span className="preview-ext">
+                              {comparePhoto?.extension.toUpperCase() ?? "--"}
+                            </span>
+                            <span className="preview-note">无预览</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ) : currentPhoto.previewSupported ? (
+                    <BufferedPreviewImage
+                      className={`rating-preview-img rating-preview-img--${previewMode}`}
+                      src={convertFileSrc(currentPhoto.path)}
+                      alt={filename ?? ""}
+                    />
+                  ) : (
+                    <div className="rating-preview-fallback">
+                      <span className="preview-ext">{currentPhoto.extension.toUpperCase()}</span>
+                      <span className="preview-note">无预览</span>
+                    </div>
+                  )}
+                  {previewMode === "fit" && prevPhoto?.previewSupported && prevPhoto.thumbnailPath && (
+                    <img className="rating-preload" src={convertFileSrc(prevPhoto.thumbnailPath)} alt="" aria-hidden="true" />
+                  )}
+                  {previewMode === "fit" && nextPhoto?.previewSupported && nextPhoto.thumbnailPath && (
+                    <img className="rating-preload" src={convertFileSrc(nextPhoto.thumbnailPath)} alt="" aria-hidden="true" />
+                  )}
+                </div>
+
+                <div className={`rating-preview-meta ${ratingImmersive ? "rating-preview-meta--immersive" : ""}`}>
+                  <div className="rating-preview-filename">{filename}</div>
+                  <div className="rating-preview-path">{currentPhoto.path}</div>
+                  <div className="rating-preview-specs">
+                    {currentPhoto.formatName ?? currentPhoto.extension.toUpperCase()}
+                    {currentPhoto.width && currentPhoto.height ? ` · ${currentPhoto.width}×${currentPhoto.height}` : ""}
+                    {currentPhoto.qualityScore != null ? ` · 质量 ${currentPhoto.qualityScore.toFixed(1)}` : ""}
+                  </div>
+
+                  <div className="rating-stars-row">
+                    {[1, 2, 3, 4, 5].map((star) => (
+                      <button
+                        key={star}
+                        className={`rating-star ${(currentRating ?? 0) >= star ? "rating-star--filled" : ""}`}
+                        onClick={() => {
+                          const nextRating = currentRating === star ? 0 : star;
+                          const fileInstanceId = currentPhoto.fileInstanceId;
+                          setRatings((prev) => new Map(prev).set(fileInstanceId, nextRating));
+                          void setRating({ fileInstanceId, rating: nextRating }).catch(() => {
+                            setRatings((prev) => new Map(prev).set(fileInstanceId, currentPhoto.userRating ?? null));
+                          });
+                        }}
+                        title={`${star} star`}
+                      >
+                        ★
+                      </button>
+                    ))}
+                    {currentRating != null && currentRating > 0 && (
+                      <button
+                        className="rating-clear-btn"
+                        onClick={() => {
+                          const fileInstanceId = currentPhoto.fileInstanceId;
+                          setRatings((prev) => new Map(prev).set(fileInstanceId, 0));
+                          void setRating({ fileInstanceId, rating: 0 });
+                        }}
+                      >
+                        清除
+                      </button>
+                    )}
+                    <span className="rating-score-label">
+                      {currentRating != null && currentRating > 0 ? `${currentRating} 星` : "未评分"}
+                    </span>
+                  </div>
+
+                  <div className="rating-nav-row">
+                    <button className="btn btn--ghost btn--sm" onClick={() => setRatingPhotoIdx((idx) => Math.max(idx - 1, 0))} disabled={ratingPhotoIdx === 0}>
+                      ← 上一张
+                    </button>
+                    <span className="rating-nav-pos">{ratingPhotoIdx + 1} / {ratingPhotos.length}</span>
+                    <button
+                      className="btn btn--ghost btn--sm"
+                      onClick={() => setRatingPhotoIdx((idx) => Math.min(idx + 1, ratingPhotos.length - 1))}
+                      disabled={ratingPhotoIdx >= ratingPhotos.length - 1}
+                    >
+                      下一张 →
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="empty-state">
+                <div className="empty-state-icon"><PhotoIcon /></div>
+                <p className="empty-state-title">{ratingLoading ? "正在加载..." : "暂无照片"}</p>
+                <p className="empty-state-body">
+                  {!ratingLoading && "先扫描目录，照片会在这里显示"}
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderHistoryTab() {
     return (
       <div className="page history-page">
@@ -1026,6 +1641,7 @@ function tabLabel(tab: AppTab): string {
   switch (tab) {
     case "scan": return "扫描";
     case "review": return "审核";
+    case "rating": return "评分";
     case "history": return "历史";
   }
 }
@@ -1033,6 +1649,7 @@ function tabLabel(tab: AppTab): string {
 function tabIcon(tab: AppTab): string {
   switch (tab) {
     case "scan": return "⊕";
+    case "rating": return "★";
     case "review": return "◈";
     case "history": return "◷";
   }
@@ -1088,3 +1705,13 @@ function delay(ms: number) {
 }
 
 export default App;
+
+
+
+
+
+
+
+
+
+

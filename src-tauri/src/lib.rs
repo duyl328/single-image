@@ -5,8 +5,9 @@ mod models;
 
 use app::{AppService, DecisionResult};
 use models::{
-    AppSnapshot, DecisionPayload, GroupDetail, GroupSummary, PathHistoryItem, ReviewActionSummary,
-    ReviewGroupFilter, ScanProgress, ScanTaskStarted, UnknownFormatSummary,
+    AppSnapshot, DecisionPayload, GroupDetail, GroupSummary, PathHistoryItem, PhotoRating,
+    RatedPhotoPage, RatingPhotoFilter, ReviewActionSummary, ReviewGroupFilter, ScanProgress,
+    ScanTaskStarted, SetRatingPayload, UnknownFormatSummary,
 };
 use tauri::Manager;
 
@@ -94,6 +95,33 @@ fn scan_cancel(service: tauri::State<'_, AppService>) -> Result<(), String> {
     service.scan_cancel().map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn rating_set(
+    service: tauri::State<'_, AppService>,
+    payload: SetRatingPayload,
+) -> Result<PhotoRating, String> {
+    service
+        .set_rating(payload.file_instance_id, payload.rating, payload.note)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn rating_undo(service: tauri::State<'_, AppService>) -> Result<Option<PhotoRating>, String> {
+    service.undo_rating().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn rating_list_photos(
+    service: tauri::State<'_, AppService>,
+    filter: RatingPhotoFilter,
+    offset: i64,
+    limit: i64,
+) -> Result<RatedPhotoPage, String> {
+    service
+        .list_rated_photos(filter, offset, limit)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -113,7 +141,10 @@ pub fn run() {
             review_get_group,
             review_apply_decision,
             file_lookup_history,
-            history_list_actions
+            history_list_actions,
+            rating_set,
+            rating_undo,
+            rating_list_photos
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

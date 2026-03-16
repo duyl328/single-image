@@ -179,6 +179,58 @@ pub struct GroupMember {
     pub role: Option<String>,
     pub captured_at: Option<String>,
     pub volume_id: Option<String>,
+    pub user_rating: Option<i32>,
+}
+
+/// A single file instance with its user rating, used in the rating/review workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatedPhoto {
+    pub file_instance_id: i64,
+    pub content_asset_id: i64,
+    pub path: String,
+    pub extension: String,
+    pub format_name: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub quality_score: Option<f32>,
+    pub preview_supported: bool,
+    pub thumbnail_path: Option<String>,
+    pub user_rating: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatedPhotoPage {
+    pub photos: Vec<RatedPhoto>,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingPhotoFilter {
+    /// If true, only return photos that have not been rated yet.
+    pub unrated_only: bool,
+    /// If set, only return photos with rating >= this value.
+    pub min_rating: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhotoRating {
+    pub file_instance_id: i64,
+    pub rating: i32,
+    pub flagged: bool,
+    pub note: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRatingPayload {
+    pub file_instance_id: i64,
+    pub rating: i32,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

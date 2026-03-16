@@ -7,10 +7,14 @@ import type {
   GroupDetail,
   GroupSummary,
   PathHistoryItem,
+  PhotoRating,
+  RatedPhotoPage,
+  RatingPhotoFilter,
   ReviewActionSummary,
   ReviewGroupFilter,
   ScanProgress,
   ScanTaskStarted,
+  SetRatingPayload,
   UnknownFormatSummary,
 } from "./types";
 
@@ -54,4 +58,20 @@ export function loadActions() {
 
 export function cancelScan() {
   return invoke<void>("scan_cancel");
+}
+
+export function setRating(payload: SetRatingPayload) {
+  return invoke<PhotoRating>("rating_set", { payload });
+}
+
+export function undoRating() {
+  return invoke<PhotoRating | null>("rating_undo");
+}
+
+export function listRatedPhotos(
+  filter: RatingPhotoFilter,
+  offset: number,
+  limit: number,
+) {
+  return invoke<RatedPhotoPage>("rating_list_photos", { filter, offset, limit });
 }

@@ -19,14 +19,15 @@ use crate::fs_id::{read_windows_identity, WindowsIdentity};
 use image::GrayImage;
 
 use crate::image_tools::{
-    analyze_asset, classify_extension, FileClass,
+    analyze_asset, classify_extension, hash_file_quick, hash_file_sha256, FileClass,
     load_similarity_buffer, ssim_from_buffers, normalized_extension, normalized_stem,
     path_to_string, AssetAnalysis, ANALYSIS_VERSION, SIMILARITY_THRESHOLD,
     PHASH_MAX_DISTANCE, DHASH_MAX_DISTANCE,
 };
 use crate::models::{
     AppSnapshot, DecisionPayload, GroupDetail, GroupMember, GroupSummary, GroupingProgress,
-    MatchKind, PathHistoryItem, ReviewActionSummary, ReviewGroupFilter, ReviewStatus,
+    MatchKind, PathHistoryItem, PhotoRating, RatedPhoto, RatedPhotoPage, RatingPhotoFilter,
+    ReviewActionSummary, ReviewGroupFilter, ReviewStatus,
     ScanActiveItem, ScanProgress, ScanRecentItem, ScanResult, ScanTaskStarted, ScanTaskStatus,
     UnknownFormatSummary,
 };
@@ -47,6 +48,9 @@ pub struct AppService {
     pub next_task_id: Arc<AtomicU64>,
     /// Set to true to request cancellation of the running scan.
     pub cancel_flag: Arc<AtomicBool>,
+    /// Stores the previous rating state for one-level undo.
+    /// (file_instance_id, previous_rating) where previous_rating=None means it was unrated.
+    pub last_rating_undo: Arc<Mutex<Option<(i64, Option<i32>)>>>,
 }
 
 #[derive(Debug)]
@@ -83,6 +87,7 @@ struct ExistingInstance {
 #[derive(Debug, Clone)]
 struct AssetRecord {
     id: i64,
+    analysis_version: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +183,7 @@ impl AppService {
             scan_progress: Arc::new(Mutex::new(ScanProgress::idle())),
             next_task_id: Arc::new(AtomicU64::new(1)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            last_rating_undo: Arc::new(Mutex::new(None)),
         };
         service.ensure_schema()?;
         Ok(service)
@@ -338,6 +344,18 @@ impl AppService {
               FOREIGN KEY(scan_run_id) REFERENCES scan_runs(id) ON DELETE CASCADE,
               UNIQUE(scan_run_id, path_key)
             );
+
+            -- User-assigned star ratings (0–5) for individual file instances.
+            -- Separate from technical quality_score; will feed future AI learning.
+            CREATE TABLE IF NOT EXISTS photo_ratings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              file_instance_id INTEGER NOT NULL UNIQUE,
+              rating INTEGER NOT NULL CHECK(rating >= 0 AND rating <= 5),
+              flagged INTEGER NOT NULL DEFAULT 0,
+              note TEXT,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(file_instance_id) REFERENCES file_instances(id) ON DELETE CASCADE
+            );
             ",
         )?;
 
@@ -459,9 +477,21 @@ impl AppService {
         let started_at = iso_now();
         self.set_scan_progress(scan_progress_counting(task_id, &started_at))?;
 
+        // Check if a previous scan was interrupted (status='running' in DB with
+        // undiscovered queue entries).  If so, resume it instead of starting fresh.
+        let interrupted = self
+            .open()
+            .ok()
+            .and_then(|conn| find_interrupted_scan_run(&conn).ok().flatten());
+
         let service = self.clone();
         thread::spawn(move || {
-            let result = service.perform_scan(paths, task_id, threads);
+            let result = match interrupted {
+                Some((run_id, run_started_at)) => {
+                    service.resume_from_queue(run_id, &run_started_at, task_id, threads)
+                }
+                None => service.perform_scan(paths, task_id, threads),
+            };
             match result {
                 Ok(scan_result) => {
                     let mut state = service.scan_progress.lock().ok();
@@ -470,11 +500,13 @@ impl AppService {
                     }
                 }
                 Err(error) => {
-                    let _ = service.set_scan_progress(scan_progress_failed(
-                        task_id,
-                        &started_at,
-                        &error.to_string(),
-                    ));
+                    let msg = error.to_string();
+                    let progress = if msg.contains("scan cancelled by user") {
+                        scan_progress_cancelled(task_id, &started_at)
+                    } else {
+                        scan_progress_failed(task_id, &started_at, &msg)
+                    };
+                    let _ = service.set_scan_progress(progress);
                 }
             }
         });
@@ -623,6 +655,85 @@ impl AppService {
             return Err(anyhow!("scan cancelled by user"));
         }
 
+        // ── Phase 2a: Quick-fingerprint pre-filter ────────────────────────────
+        // For each pending file, compute the cheap BLAKE3 partial hash
+        // (≤ 192 KB read) and check if a content_asset with matching
+        // (file_size, quick_fingerprint, analysis_version) already exists.
+        // Files that hit the cache skip the expensive decode / phash / thumbnail
+        // pipeline entirely; only files with genuinely unknown content continue
+        // to the parallel analysis phase.
+        let pending_analysis = {
+            let conn = self.open()?;
+            let mut fast_items: Vec<(PendingFileAnalysis, i64)> =
+                Vec::with_capacity(pending_analysis.len() / 4);
+            let mut truly_pending: Vec<PendingFileAnalysis> =
+                Vec::with_capacity(pending_analysis.len());
+
+            for item in pending_analysis {
+                let found = hash_file_quick(&item.file_path, item.file_size as u64)
+                    .ok()
+                    .and_then(|qfp| {
+                        find_asset_by_quick_fingerprint(
+                            &conn,
+                            item.file_size,
+                            &qfp,
+                            ANALYSIS_VERSION,
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                    .and_then(|(asset_id, expected_sha256)| {
+                        // Verify with full SHA-256 to guard against quick-hash
+                        // collisions (different content, same partial fingerprint).
+                        let actual = hash_file_sha256(&item.file_path).ok()?;
+                        if actual == expected_sha256 { Some(asset_id) } else { None }
+                    });
+                match found {
+                    Some(asset_id) => fast_items.push((item, asset_id)),
+                    None => truly_pending.push(item),
+                }
+            }
+
+            if !fast_items.is_empty() {
+                let mut conn2 = self.open()?;
+                let tx = conn2.transaction()?;
+                for (item, asset_id) in fast_items {
+                    match commit_fast_path_file(&tx, &scan_run, &item, asset_id, &started_at)? {
+                        ScanDisposition::NewFile => new_files += 1,
+                        ScanDisposition::UpdatedLocation => updated_locations += 1,
+                        ScanDisposition::Unchanged => unchanged_files += 1,
+                    }
+                }
+                tx.commit()?;
+            }
+
+            // ── Persist queue for crash-resume ───────────────────────────────
+            // Write all files still needing analysis to scan_queue so that an
+            // interrupted scan can be resumed instead of restarted from scratch.
+            if !truly_pending.is_empty() {
+                let mut qconn = self.open()?;
+                let qtx = qconn.transaction()?;
+                for item in &truly_pending {
+                    qtx.execute(
+                        "INSERT OR IGNORE INTO scan_queue
+                         (scan_run_id, path, path_key, file_class, file_size, modified_ms, stage)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'discovered')",
+                        params![
+                            scan_run.id,
+                            item.display_path,
+                            item.path_key,
+                            item.file_class.as_str(),
+                            item.file_size,
+                            item.modified_ms,
+                        ],
+                    )?;
+                }
+                qtx.commit()?;
+            }
+
+            truly_pending
+        };
+
         // ── Phase 2: Parallel analysis + per-batch commits ───────────────────
         let total_images = unchanged_files + updated_locations + new_files + pending_analysis.len();
         {
@@ -653,6 +764,10 @@ impl AppService {
         let mut done_count = unchanged_files + updated_locations + new_files;
         let total_pending = pending_analysis.len();
         let mut queued_remaining = total_pending;
+        // Track content_asset IDs created for the first time in this scan.
+        // Passed to recompute_groups so SSIM is only computed for pairs that
+        // involve at least one genuinely new asset.
+        let mut new_content_asset_ids: HashSet<i64> = HashSet::new();
 
         for chunk in pending_analysis.chunks(chunk_size) {
             // Show active files before processing.
@@ -671,47 +786,84 @@ impl AppService {
             }
 
             let thumbs_dir = &self.thumbs_dir;
-            let analyzed: Vec<AnalyzedFile> = pool.install(|| {
+            // Collect both successes and failures; failures carry the file name
+            // for display in the recent-items list.
+            let analysis_results: Vec<Result<AnalyzedFile, String>> = pool.install(|| {
                 chunk
                     .par_iter()
                     .cloned()
-                    .filter_map(|pending| {
-                        match analyze_pending_file(pending, thumbs_dir) {
-                            Ok(item) => Some(item),
-                            Err(_) => None, // skip failed files silently
-                        }
+                    .map(|pending| {
+                        let display = pending.display_path.clone();
+                        analyze_pending_file(pending, thumbs_dir)
+                            .map_err(|e| format!("{display}: {e}"))
                     })
                     .collect()
             });
 
             // Commit this batch in its own transaction.
             let mut chunk_recent: Vec<ScanRecentItem> = Vec::new();
+            let mut batch_failed: usize = 0;
             {
                 let mut conn = self.open()?;
                 let tx = conn.transaction()?;
-                for item in analyzed {
-                    let fname = file_name_hint(&item.pending.display_path);
-                    let status_str = match self.commit_analyzed_file(&tx, &scan_run, item, &started_at)? {
-                        ScanDisposition::NewFile => {
-                            new_files += 1;
-                            "new"
+                for result in analysis_results {
+                    match result {
+                        Err(err_msg) => {
+                            batch_failed += 1;
+                            done_count += 1;
+                            chunk_recent.push(ScanRecentItem {
+                                file_name: err_msg,
+                                status: "failed".to_string(),
+                            });
                         }
-                        ScanDisposition::UpdatedLocation => {
-                            updated_locations += 1;
-                            "updated"
+                        Ok(item) => {
+                            let fname = file_name_hint(&item.pending.display_path);
+                            let (disposition, new_id) =
+                                self.commit_analyzed_file(&tx, &scan_run, item, &started_at)?;
+                            if let Some(id) = new_id {
+                                new_content_asset_ids.insert(id);
+                            }
+                            let status_str = match disposition {
+                                ScanDisposition::NewFile => {
+                                    new_files += 1;
+                                    "new"
+                                }
+                                ScanDisposition::UpdatedLocation => {
+                                    updated_locations += 1;
+                                    "updated"
+                                }
+                                ScanDisposition::Unchanged => {
+                                    unchanged_files += 1;
+                                    "unchanged"
+                                }
+                            };
+                            done_count += 1;
+                            chunk_recent.push(ScanRecentItem {
+                                file_name: fname,
+                                status: status_str.to_string(),
+                            });
                         }
-                        ScanDisposition::Unchanged => {
-                            unchanged_files += 1;
-                            "unchanged"
-                        }
-                    };
-                    done_count += 1;
-                    chunk_recent.push(ScanRecentItem {
-                        file_name: fname,
-                        status: status_str.to_string(),
-                    });
+                    }
                 }
                 tx.commit()?;
+            }
+
+            // Mark this chunk's entries as promoted in scan_queue so a resume
+            // after crash won't re-analyse files we just committed.
+            {
+                let chunk_keys: Vec<&str> = chunk.iter().map(|i| i.path_key.as_str()).collect();
+                if let Ok(mut qconn) = self.open() {
+                    if let Ok(qtx) = qconn.transaction() {
+                        for key in &chunk_keys {
+                            let _ = qtx.execute(
+                                "UPDATE scan_queue SET stage = 'promoted'
+                                 WHERE scan_run_id = ?1 AND path_key = ?2",
+                                params![scan_run.id, key],
+                            );
+                        }
+                        let _ = qtx.commit();
+                    }
+                }
             }
 
             // Update progress once per batch.
@@ -721,6 +873,7 @@ impl AppService {
                 p.new_files = new_files;
                 p.updated_files = updated_locations;
                 p.unchanged_files = unchanged_files;
+                p.failed_files += batch_failed;
                 p.active_items = Vec::new();
                 p.analyzing = 0;
                 p.recent_items.extend(chunk_recent);
@@ -755,7 +908,9 @@ impl AppService {
             rewrite_unknown_formats(&tx, scan_run.id, &unsupported)?;
 
             // Groups run inside the same bounded thread pool.
-            recompute_groups(&tx, &self.scan_progress, &pool)?;
+            // new_content_asset_ids drives incremental SSIM: only asset pairs
+            // that include a genuinely new asset need SSIM computation.
+            recompute_groups(&tx, &self.scan_progress, &pool, &new_content_asset_ids)?;
 
             completed_at = iso_now();
             tx.execute(
@@ -786,6 +941,288 @@ impl AppService {
             updated_locations,
             unchanged_files,
             unsupported_extensions: unsupported.into_values().collect(),
+        })
+    }
+
+    /// Resume an interrupted scan from the scan_queue.
+    ///
+    /// Skips Phase 1 (directory walk) and Phase 2a (quick-fingerprint filter).
+    /// Loads `stage='discovered'` entries from the queue, re-reads file metadata
+    /// from disk, and picks up from Phase 2 (parallel analysis).
+    /// Phase 3 (recompute_groups + mark completed) runs normally at the end.
+    fn resume_from_queue(
+        &self,
+        run_id: i64,
+        run_started_at: &str,
+        task_id: u64,
+        threads: usize,
+    ) -> Result<ScanResult> {
+        self.set_scan_progress(scan_progress_counting(task_id, run_started_at))?;
+
+        // Load the interrupted run's metadata.
+        let (roots_json,): (String,) = {
+            let conn = self.open()?;
+            conn.query_row(
+                "SELECT roots_json FROM scan_runs WHERE id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?,)),
+            )?
+        };
+        let display_roots: Vec<String> = serde_json::from_str(&roots_json)
+            .unwrap_or_default();
+
+        // Load undiscovered queue entries.
+        let queue_items: Vec<(String, String, String, i64, i64)> = {
+            let conn = self.open()?;
+            let mut stmt = conn.prepare(
+                "SELECT path, path_key, file_class, file_size, modified_ms
+                 FROM scan_queue
+                 WHERE scan_run_id = ?1 AND stage = 'discovered'",
+            )?;
+            let rows = stmt.query_map([run_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        if queue_items.is_empty() {
+            // Nothing left; just mark the run completed with zeros.
+            let completed_at = iso_now();
+            let conn = self.open()?;
+            conn.execute(
+                "UPDATE scan_runs SET status='completed', completed_at=?2 WHERE id=?1",
+                params![run_id, completed_at],
+            )?;
+            return Ok(ScanResult {
+                scan_run_id: run_id,
+                started_at: run_started_at.to_string(),
+                completed_at,
+                scanned_roots: display_roots,
+                new_files: 0,
+                updated_locations: 0,
+                unchanged_files: 0,
+                unsupported_extensions: Vec::new(),
+            });
+        }
+
+        // Rebuild PendingFileAnalysis from queue; skip files that no longer exist.
+        let scan_run = ScanRun { id: run_id, started_at: run_started_at.to_string() };
+        let mut pending_analysis: Vec<PendingFileAnalysis> = Vec::with_capacity(queue_items.len());
+        for (path_str, path_key, file_class_str, file_size, modified_ms) in queue_items {
+            let file_path = PathBuf::from(&path_str);
+            if !file_path.exists() {
+                continue;
+            }
+            let file_class = match file_class_str.as_str() {
+                "raw_image" => FileClass::RawImage,
+                "video" => FileClass::Video,
+                _ => FileClass::Image,
+            };
+            let windows_identity = read_windows_identity(&file_path).ok();
+            let extension = normalized_extension(&file_path);
+            pending_analysis.push(PendingFileAnalysis {
+                file_path,
+                display_path: path_str,
+                path_key,
+                extension,
+                file_class,
+                file_size,
+                modified_ms,
+                windows_identity,
+            });
+        }
+
+        let total_images = pending_analysis.len();
+        {
+            let mut p = self.lock_progress()?;
+            p.status = ScanTaskStatus::Running;
+            p.phase = "indexing".to_string();
+            p.message = "Resuming interrupted scan.".to_string();
+            p.total_files = total_images;
+            p.done = 0;
+            p.queued = total_images;
+            p.analyzing = 0;
+            p.new_files = 0;
+            p.updated_files = 0;
+            p.unchanged_files = 0;
+            p.failed_files = 0;
+            p.active_items = Vec::new();
+            p.recent_items = Vec::new();
+            p.grouping = None;
+        }
+
+        let workers = cmp::max(1, threads);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .context("failed to build rayon thread pool")?;
+
+        let chunk_size = cmp::max(4, workers * 2).min(SCAN_BATCH_SIZE);
+        let mut done_count = 0usize;
+        let mut queued_remaining = total_images;
+        let mut new_files = 0usize;
+        let mut updated_locations = 0usize;
+        let mut unchanged_files = 0usize;
+        let mut new_content_asset_ids: HashSet<i64> = HashSet::new();
+
+        for chunk in pending_analysis.chunks(chunk_size) {
+            {
+                let mut p = self.lock_progress()?;
+                p.active_items = chunk
+                    .iter()
+                    .map(|item| ScanActiveItem {
+                        file_name: file_name_hint(&item.display_path),
+                        dir_hint: dir_hint(&item.display_path),
+                    })
+                    .collect();
+                p.analyzing = chunk.len();
+                queued_remaining = queued_remaining.saturating_sub(chunk.len());
+                p.queued = queued_remaining;
+            }
+
+            let thumbs_dir = &self.thumbs_dir;
+            let analysis_results: Vec<Result<AnalyzedFile, String>> = pool.install(|| {
+                chunk
+                    .par_iter()
+                    .cloned()
+                    .map(|pending| {
+                        let display = pending.display_path.clone();
+                        analyze_pending_file(pending, thumbs_dir)
+                            .map_err(|e| format!("{display}: {e}"))
+                    })
+                    .collect()
+            });
+
+            let mut chunk_recent: Vec<ScanRecentItem> = Vec::new();
+            let mut batch_failed: usize = 0;
+            {
+                let mut conn = self.open()?;
+                let tx = conn.transaction()?;
+                for result in analysis_results {
+                    match result {
+                        Err(err_msg) => {
+                            batch_failed += 1;
+                            done_count += 1;
+                            chunk_recent.push(ScanRecentItem {
+                                file_name: err_msg,
+                                status: "failed".to_string(),
+                            });
+                        }
+                        Ok(item) => {
+                            let fname = file_name_hint(&item.pending.display_path);
+                            let (disposition, new_id) =
+                                self.commit_analyzed_file(&tx, &scan_run, item, run_started_at)?;
+                            if let Some(id) = new_id {
+                                new_content_asset_ids.insert(id);
+                            }
+                            let status_str = match disposition {
+                                ScanDisposition::NewFile => { new_files += 1; "new" }
+                                ScanDisposition::UpdatedLocation => { updated_locations += 1; "updated" }
+                                ScanDisposition::Unchanged => { unchanged_files += 1; "unchanged" }
+                            };
+                            done_count += 1;
+                            chunk_recent.push(ScanRecentItem {
+                                file_name: fname,
+                                status: status_str.to_string(),
+                            });
+                        }
+                    }
+                }
+                tx.commit()?;
+            }
+
+            // Mark this chunk as promoted in scan_queue.
+            {
+                let chunk_keys: Vec<&str> = chunk.iter().map(|i| i.path_key.as_str()).collect();
+                if let Ok(mut qconn) = self.open() {
+                    if let Ok(qtx) = qconn.transaction() {
+                        for key in &chunk_keys {
+                            let _ = qtx.execute(
+                                "UPDATE scan_queue SET stage = 'promoted'
+                                 WHERE scan_run_id = ?1 AND path_key = ?2",
+                                params![run_id, key],
+                            );
+                        }
+                        let _ = qtx.commit();
+                    }
+                }
+            }
+
+            {
+                let mut p = self.lock_progress()?;
+                p.done = done_count;
+                p.new_files = new_files;
+                p.updated_files = updated_locations;
+                p.unchanged_files = unchanged_files;
+                p.failed_files += batch_failed;
+                p.active_items = Vec::new();
+                p.analyzing = 0;
+                p.recent_items.extend(chunk_recent);
+                let len = p.recent_items.len();
+                if len > 8 {
+                    p.recent_items.drain(0..(len - 8));
+                }
+            }
+
+            if self.is_cancelled() {
+                self.mark_scan_run_cancelled(run_id)?;
+                return Err(anyhow!("scan cancelled by user"));
+            }
+        }
+
+        // Phase 3: finalise.
+        {
+            let mut p = self.lock_progress()?;
+            p.status = ScanTaskStatus::Finalizing;
+            p.phase = "finalizing".to_string();
+            p.message = "Grouping duplicates and similar photos.".to_string();
+        }
+
+        let completed_at;
+        {
+            let mut conn = self.open()?;
+            let tx = conn.transaction()?;
+            recompute_groups(&tx, &self.scan_progress, &pool, &new_content_asset_ids)?;
+            completed_at = iso_now();
+            tx.execute(
+                "UPDATE scan_runs
+                 SET status = 'completed',
+                     completed_at = ?2,
+                     new_files = ?3,
+                     updated_locations = ?4,
+                     unchanged_files = ?5
+                 WHERE id = ?1",
+                params![
+                    run_id,
+                    completed_at,
+                    new_files as i64,
+                    updated_locations as i64,
+                    unchanged_files as i64
+                ],
+            )?;
+            tx.commit()?;
+        }
+
+        {
+            let mut p = self.lock_progress()?;
+            p.grouping = None;
+        }
+
+        Ok(ScanResult {
+            scan_run_id: run_id,
+            started_at: run_started_at.to_string(),
+            completed_at,
+            scanned_roots: display_roots,
+            new_files,
+            updated_locations,
+            unchanged_files,
+            unsupported_extensions: Vec::new(),
         })
     }
 
@@ -887,10 +1324,12 @@ impl AppService {
                     gm.similarity,
                     gm.role,
                     ca.captured_at,
-                    fi.volume_id
+                    fi.volume_id,
+                    pr.rating
              FROM group_members gm
              JOIN file_instances fi ON fi.id = gm.file_instance_id
              JOIN content_assets ca ON ca.id = gm.content_asset_id
+             LEFT JOIN photo_ratings pr ON pr.file_instance_id = gm.file_instance_id
              WHERE gm.group_id = ?1
              ORDER BY COALESCE(ca.quality_score, 0) DESC, fi.current_path ASC",
         )?;
@@ -915,6 +1354,7 @@ impl AppService {
                     role: row.get(14)?,
                     captured_at: row.get(15)?,
                     volume_id: row.get(16)?,
+                    user_rating: row.get(17)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -981,11 +1421,7 @@ impl AppService {
             "UPDATE match_groups SET status = 'applied', updated_at = ?2 WHERE id = ?1",
             params![group_id, applied_at],
         )?;
-        let default_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
-        recompute_groups(&tx, &self.scan_progress, &default_pool)?;
+        prune_stale_group_members(&tx)?;
         tx.commit()?;
 
         Ok(DecisionResult {
@@ -1042,6 +1478,180 @@ impl AppService {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// UPSERT a user rating (0–5) for the given file instance.
+    /// Saves the previous state so `undo_rating` can restore it.
+    pub fn set_rating(
+        &self,
+        file_instance_id: i64,
+        rating: i32,
+        note: Option<String>,
+    ) -> Result<PhotoRating> {
+        if !(0..=5).contains(&rating) {
+            return Err(anyhow!("rating must be between 0 and 5"));
+        }
+        let conn = self.open()?;
+
+        // Read previous state for undo.
+        let previous: Option<i32> = conn
+            .query_row(
+                "SELECT rating FROM photo_ratings WHERE file_instance_id = ?1",
+                [file_instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        {
+            let mut undo = self
+                .last_rating_undo
+                .lock()
+                .map_err(|_| anyhow!("undo lock poisoned"))?;
+            *undo = Some((file_instance_id, previous));
+        }
+
+        let updated_at = iso_now();
+        conn.execute(
+            "INSERT INTO photo_ratings (file_instance_id, rating, note, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_instance_id) DO UPDATE SET
+               rating     = excluded.rating,
+               note       = excluded.note,
+               updated_at = excluded.updated_at",
+            params![file_instance_id, rating, note.clone(), updated_at.clone()],
+        )?;
+
+        Ok(PhotoRating {
+            file_instance_id,
+            rating,
+            flagged: false,
+            note,
+            updated_at,
+        })
+    }
+
+    /// Undo the last `set_rating` call.  Returns the restored rating (or None
+    /// if the file was unrated before and the rating row was deleted).
+    pub fn undo_rating(&self) -> Result<Option<PhotoRating>> {
+        let undo_state = {
+            let mut undo = self
+                .last_rating_undo
+                .lock()
+                .map_err(|_| anyhow!("undo lock poisoned"))?;
+            undo.take()
+        };
+
+        let (file_instance_id, previous_rating) = match undo_state {
+            None => return Ok(None),
+            Some(state) => state,
+        };
+
+        let conn = self.open()?;
+        let updated_at = iso_now();
+
+        match previous_rating {
+            None => {
+                conn.execute(
+                    "DELETE FROM photo_ratings WHERE file_instance_id = ?1",
+                    [file_instance_id],
+                )?;
+                Ok(None)
+            }
+            Some(prev) => {
+                conn.execute(
+                    "INSERT INTO photo_ratings (file_instance_id, rating, note, updated_at)
+                     VALUES (?1, ?2, NULL, ?3)
+                     ON CONFLICT(file_instance_id) DO UPDATE SET
+                       rating     = excluded.rating,
+                       note       = excluded.note,
+                       updated_at = excluded.updated_at",
+                    params![file_instance_id, prev, updated_at.clone()],
+                )?;
+                Ok(Some(PhotoRating {
+                    file_instance_id,
+                    rating: prev,
+                    flagged: false,
+                    note: None,
+                    updated_at,
+                }))
+            }
+        }
+    }
+
+    /// Return a paginated list of all indexed image file instances with their ratings.
+    /// `offset` and `limit` are used for pagination.
+    pub fn list_rated_photos(
+        &self,
+        filter: RatingPhotoFilter,
+        offset: i64,
+        limit: i64,
+    ) -> Result<RatedPhotoPage> {
+        let conn = self.open()?;
+
+        // Build WHERE clause based on filter.
+        // unrated_only → pr.rating IS NULL
+        // min_rating   → pr.rating >= min_rating
+        let unrated_only = filter.unrated_only;
+        let min_rating = filter.min_rating;
+
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM file_instances fi
+             JOIN content_assets ca ON ca.id = fi.content_asset_id
+             LEFT JOIN photo_ratings pr ON pr.file_instance_id = fi.id
+             WHERE fi.exists_flag = 1
+               AND fi.file_class = 'image'
+               AND (?1 = 0 OR pr.rating IS NULL)
+               AND (?2 IS NULL OR pr.rating >= ?2)",
+            params![i32::from(unrated_only), min_rating],
+            |row| row.get(0),
+        )?;
+
+        let mut stmt = conn.prepare(
+            "SELECT fi.id,
+                    fi.content_asset_id,
+                    fi.current_path,
+                    fi.extension,
+                    ca.format_name,
+                    ca.width,
+                    ca.height,
+                    ca.quality_score,
+                    ca.preview_supported,
+                    ca.thumbnail_path,
+                    pr.rating
+             FROM file_instances fi
+             JOIN content_assets ca ON ca.id = fi.content_asset_id
+             LEFT JOIN photo_ratings pr ON pr.file_instance_id = fi.id
+             WHERE fi.exists_flag = 1
+               AND fi.file_class = 'image'
+               AND (?1 = 0 OR pr.rating IS NULL)
+               AND (?2 IS NULL OR pr.rating >= ?2)
+             ORDER BY fi.id ASC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+
+        let photos = stmt
+            .query_map(
+                params![i32::from(unrated_only), min_rating, limit, offset],
+                |row| {
+                    Ok(RatedPhoto {
+                        file_instance_id: row.get(0)?,
+                        content_asset_id: row.get(1)?,
+                        path: row.get(2)?,
+                        extension: row.get(3)?,
+                        format_name: row.get(4)?,
+                        width: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                        height: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                        quality_score: row.get::<_, Option<f64>>(7)?.map(|v| v as f32),
+                        preview_supported: row.get::<_, i64>(8)? == 1,
+                        thumbnail_path: row.get(9)?,
+                        user_rating: row.get(10)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(RatedPhotoPage { photos, total })
+    }
+
     fn prepare_file_path(
         &self,
         tx: &Transaction<'_>,
@@ -1064,16 +1674,32 @@ impl AppService {
                 && existing.exists_flag
                 && identity_matches(&existing, windows_identity.as_ref())
             {
-                update_instance_seen(
-                    tx,
-                    existing.id,
-                    scan_run.id,
-                    observed_at,
-                    file_size,
-                    modified_ms,
-                    windows_identity.as_ref(),
-                )?;
-                return Ok(PreparedImagePath::Disposition(ScanDisposition::Unchanged));
+                // File on disk is byte-for-byte the same as last scan.
+                // But re-analysis is required when the asset's analysis_version
+                // is older than the current one (e.g. new quality algorithm).
+                let asset_version: Option<i32> = tx
+                    .query_row(
+                        "SELECT ca.analysis_version
+                         FROM file_instances fi
+                         JOIN content_assets ca ON ca.id = fi.content_asset_id
+                         WHERE fi.id = ?1",
+                        [existing.id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if asset_version == Some(ANALYSIS_VERSION) {
+                    update_instance_seen(
+                        tx,
+                        existing.id,
+                        scan_run.id,
+                        observed_at,
+                        file_size,
+                        modified_ms,
+                        windows_identity.as_ref(),
+                    )?;
+                    return Ok(PreparedImagePath::Disposition(ScanDisposition::Unchanged));
+                }
+                // analysis_version is stale — fall through to re-analysis.
             }
         }
 
@@ -1114,25 +1740,38 @@ impl AppService {
         }))
     }
 
+    /// Commits an analysed file to the DB.  Returns the scan disposition plus,
+    /// when a brand-new `content_asset` row was created, its id.  Callers use
+    /// the id set to drive incremental group recomputation.
     fn commit_analyzed_file(
         &self,
         tx: &Transaction<'_>,
         scan_run: &ScanRun,
         item: AnalyzedFile,
         observed_at: &str,
-    ) -> Result<ScanDisposition> {
-        let asset_id = if let Some(asset) = find_asset_by_sha(tx, &item.analysis.sha256)? {
-            asset.id
-        } else {
-            create_asset_record(
-                tx,
-                &item.pending.extension,
-                item.pending.file_size,
-                item.pending.file_class,
-                observed_at,
-                &item.analysis,
-            )?
-        };
+    ) -> Result<(ScanDisposition, Option<i64>)> {
+        let (asset_id, new_asset_id) =
+            if let Some(asset) = find_asset_by_sha(tx, &item.analysis.sha256)? {
+                if asset.analysis_version < ANALYSIS_VERSION {
+                    // Existing asset is stale — update its analysis fields so
+                    // phash/quality/thumbnail reflect the current algorithm.
+                    update_content_asset_analysis(tx, asset.id, &item.analysis)?;
+                    // Treat as "new" for incremental grouping so SSIM is recomputed.
+                    (asset.id, Some(asset.id))
+                } else {
+                    (asset.id, None)
+                }
+            } else {
+                let id = create_asset_record(
+                    tx,
+                    &item.pending.extension,
+                    item.pending.file_size,
+                    item.pending.file_class,
+                    observed_at,
+                    &item.analysis,
+                )?;
+                (id, Some(id))
+            };
 
         if let Some(existing) = find_instance_by_path_key(tx, &item.pending.path_key)? {
             tx.execute(
@@ -1167,7 +1806,7 @@ impl AppService {
                     scan_run.id
                 ],
             )?;
-            return Ok(ScanDisposition::Unchanged);
+            return Ok((ScanDisposition::Unchanged, new_asset_id));
         }
 
         if let Some(existing) = find_relocation_candidate(tx, asset_id, &item.pending.path_key)? {
@@ -1184,7 +1823,7 @@ impl AppService {
                 item.pending.windows_identity.as_ref(),
                 "cross_volume_move",
             )?;
-            return Ok(ScanDisposition::UpdatedLocation);
+            return Ok((ScanDisposition::UpdatedLocation, new_asset_id));
         }
 
         insert_instance(
@@ -1200,7 +1839,7 @@ impl AppService {
             scan_run.id,
             observed_at,
         )?;
-        Ok(ScanDisposition::NewFile)
+        Ok((ScanDisposition::NewFile, new_asset_id))
     }
 }
 
@@ -1310,6 +1949,30 @@ fn scan_progress_completed(task_id: u64, scan_result: &ScanResult) -> ScanProgre
     }
 }
 
+fn scan_progress_cancelled(task_id: u64, started_at: &str) -> ScanProgress {
+    ScanProgress {
+        task_id: Some(task_id),
+        status: ScanTaskStatus::Cancelled,
+        phase: "cancelled".to_string(),
+        message: "Scan was cancelled.".to_string(),
+        total_files: 0,
+        queued: 0,
+        analyzing: 0,
+        done: 0,
+        new_files: 0,
+        updated_files: 0,
+        unchanged_files: 0,
+        failed_files: 0,
+        active_items: Vec::new(),
+        recent_items: Vec::new(),
+        grouping: None,
+        started_at: Some(started_at.to_string()),
+        completed_at: Some(iso_now()),
+        result: None,
+        error: None,
+    }
+}
+
 fn scan_progress_failed(task_id: u64, started_at: &str, error: &str) -> ScanProgress {
     ScanProgress {
         task_id: Some(task_id),
@@ -1334,6 +1997,27 @@ fn scan_progress_failed(task_id: u64, started_at: &str, error: &str) -> ScanProg
     }
 }
 
+
+/// Return the most recent scan_run that was left in status='running' (i.e. the
+/// app crashed mid-scan) AND still has undiscovered scan_queue entries to
+/// process.  Returns `(scan_run_id, started_at)`.
+fn find_interrupted_scan_run(conn: &Connection) -> Result<Option<(i64, String)>> {
+    let result = conn.query_row(
+        "SELECT sr.id, sr.started_at
+         FROM scan_runs sr
+         WHERE sr.status = 'running'
+           AND EXISTS (
+               SELECT 1 FROM scan_queue sq
+               WHERE sq.scan_run_id = sr.id AND sq.stage = 'discovered'
+           )
+         ORDER BY sr.id DESC
+         LIMIT 1",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()?;
+    Ok(result)
+}
 
 fn create_scan_run(tx: &Transaction<'_>, roots: &[String], started_at: &str) -> Result<ScanRun> {
     tx.execute(
@@ -1431,9 +2115,79 @@ fn find_relocation_candidate(
     Ok(relocation)
 }
 
+/// Fast pre-check: is this (file_size, quick_fingerprint) already indexed at the
+/// required analysis_version?  Returns `(asset_id, sha256)` on a hit so the
+/// caller can verify the full SHA-256 before treating the asset as identical.
+/// Uses the index on content_assets(file_size, quick_fingerprint).
+fn find_asset_by_quick_fingerprint(
+    conn: &Connection,
+    file_size: i64,
+    quick_fingerprint: &str,
+    analysis_version: i32,
+) -> Result<Option<(i64, String)>> {
+    conn.query_row(
+        "SELECT id, sha256 FROM content_assets
+         WHERE file_size = ?1 AND quick_fingerprint = ?2 AND analysis_version = ?3
+         LIMIT 1",
+        params![file_size, quick_fingerprint, analysis_version],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Fast-path commit for a file whose content_asset already exists in the DB.
+/// Creates or updates the file_instance record without any image analysis.
+fn commit_fast_path_file(
+    tx: &Transaction<'_>,
+    scan_run: &ScanRun,
+    pending: &PendingFileAnalysis,
+    asset_id: i64,
+    observed_at: &str,
+) -> Result<ScanDisposition> {
+    if let Some(existing) = find_instance_by_path_key(tx, &pending.path_key)? {
+        tx.execute(
+            "UPDATE file_instances
+             SET content_asset_id = ?2,
+                 file_size        = ?3,
+                 modified_ms      = ?4,
+                 exists_flag      = 1,
+                 last_seen_at     = ?5,
+                 last_scan_run_id = ?6
+             WHERE id = ?1",
+            params![
+                existing.id,
+                asset_id,
+                pending.file_size,
+                pending.modified_ms,
+                observed_at,
+                scan_run.id
+            ],
+        )?;
+        // Content didn't change (quick fingerprint matched); treat as unchanged.
+        return Ok(ScanDisposition::Unchanged);
+    }
+
+    // New path, known content → insert a fresh file_instance.
+    insert_instance(
+        tx,
+        asset_id,
+        &pending.display_path,
+        &pending.path_key,
+        pending.windows_identity.as_ref(),
+        pending.file_size,
+        pending.modified_ms,
+        &pending.extension,
+        pending.file_class,
+        scan_run.id,
+        observed_at,
+    )?;
+    Ok(ScanDisposition::NewFile)
+}
+
 fn find_asset_by_sha(tx: &Transaction<'_>, sha256: &str) -> Result<Option<AssetRecord>> {
     tx.query_row(
-        "SELECT id FROM content_assets WHERE sha256 = ?1",
+        "SELECT id, analysis_version FROM content_assets WHERE sha256 = ?1",
         [sha256],
         map_asset_record,
     )
@@ -1494,6 +2248,45 @@ fn create_asset_record(
         ],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+/// Update the analysis fields of an existing content_asset whose SHA-256
+/// matched but whose analysis_version is older than ANALYSIS_VERSION.
+fn update_content_asset_analysis(
+    tx: &Transaction<'_>,
+    asset_id: i64,
+    analysis: &AssetAnalysis,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE content_assets
+         SET phash             = ?2,
+             dhash             = ?3,
+             quality_score     = ?4,
+             thumbnail_path    = ?5,
+             preview_supported = ?6,
+             width             = ?7,
+             height            = ?8,
+             format_name       = ?9,
+             quick_fingerprint = ?10,
+             analysis_version  = ?11,
+             updated_at        = ?12
+         WHERE id = ?1",
+        params![
+            asset_id,
+            analysis.phash.clone(),
+            analysis.dhash.clone(),
+            analysis.quality_score.map(f64::from),
+            analysis.thumbnail_path.clone(),
+            i64::from(analysis.preview_supported),
+            analysis.width.map(i64::from),
+            analysis.height.map(i64::from),
+            analysis.format_name.clone(),
+            analysis.quick_fingerprint.clone(),
+            ANALYSIS_VERSION,
+            iso_now(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_instance(
@@ -1768,10 +2561,59 @@ fn validate_decision(
     Ok((group_kind, recycle_targets))
 }
 
+/// Lightweight post-decision cleanup. After files are recycled we only need to:
+///  1. Remove their group_members rows.
+///  2. Delete groups that now have < 2 active members (and are not yet applied).
+///  3. Update recommended_keep_instance_id when the old recommendation was recycled.
+///
+/// This is much cheaper than a full `recompute_groups` call which would reload
+/// every active record and redo BK-tree + SSIM for the whole library.
+fn prune_stale_group_members(tx: &Transaction<'_>) -> Result<()> {
+    // 1. Drop members whose file no longer exists on disk.
+    tx.execute(
+        "DELETE FROM group_members
+         WHERE file_instance_id IN (
+             SELECT id FROM file_instances WHERE exists_flag = 0
+         )",
+        [],
+    )?;
+
+    // 2. Delete non-applied groups that now have fewer than 2 live members.
+    tx.execute(
+        "DELETE FROM match_groups
+         WHERE status != 'applied'
+           AND (
+               SELECT COUNT(*) FROM group_members WHERE group_id = match_groups.id
+           ) < 2",
+        [],
+    )?;
+
+    // 3. Fix recommended_keep_instance_id if the recommended file was recycled.
+    tx.execute(
+        "UPDATE match_groups
+         SET recommended_keep_instance_id = (
+             SELECT gm.file_instance_id
+             FROM group_members gm
+             JOIN file_instances fi ON fi.id = gm.file_instance_id
+             JOIN content_assets ca ON ca.id = fi.content_asset_id
+             WHERE gm.group_id = match_groups.id AND fi.exists_flag = 1
+             ORDER BY COALESCE(ca.quality_score, 0) DESC
+             LIMIT 1
+         )
+         WHERE recommended_keep_instance_id IN (
+             SELECT id FROM file_instances WHERE exists_flag = 0
+         )",
+        [],
+    )?;
+
+    Ok(())
+}
+
 fn recompute_groups(
     tx: &Transaction<'_>,
     scan_progress: &Arc<Mutex<ScanProgress>>,
     pool: &rayon::ThreadPool,
+    new_asset_ids: &HashSet<i64>,
 ) -> Result<()> {
     let records = load_active_records(tx)?;
 
@@ -1782,6 +2624,16 @@ fn recompute_groups(
         });
     }
 
+    // In incremental mode (new_asset_ids non-empty), seed the similar-pair
+    // cache from existing DB groups so that old confirmed-similar pairs are
+    // preserved without recomputing SSIM.  New pairs (involving at least one
+    // new asset) are still computed fresh.
+    let cached_similar_pairs = if new_asset_ids.is_empty() {
+        HashMap::new()
+    } else {
+        load_existing_similar_pairs(tx)?
+    };
+
     let ((exact_drafts, raw_jpeg_drafts), similar_result) = pool.install(|| {
         rayon::join(
             || {
@@ -1789,7 +2641,7 @@ fn recompute_groups(
                 let raw_jpeg = build_raw_jpeg_groups(&records);
                 (exact, raw_jpeg)
             },
-            || build_similar_groups(&records, scan_progress),
+            || build_similar_groups(&records, scan_progress, new_asset_ids, &cached_similar_pairs),
         )
     });
     let similar_drafts = similar_result?;
@@ -1858,6 +2710,15 @@ fn recompute_groups(
         };
 
         active_group_ids.insert(group_id);
+    }
+
+    // In incremental mode, preserve existing similar groups that were not
+    // touched by this scan (none of their members is a new asset AND all
+    // members are still alive on disk).  These groups were correctly computed
+    // in a previous run and need no changes.
+    if !new_asset_ids.is_empty() {
+        let preserved = load_untouched_similar_group_ids(tx, new_asset_ids)?;
+        active_group_ids.extend(preserved);
     }
 
     let mut stale = tx.prepare("SELECT id, status FROM match_groups")?;
@@ -2021,9 +2882,23 @@ fn build_exact_groups(records: &[ActiveRecord]) -> Vec<GroupDraft> {
 /// confirmed similar to EVERY existing member.  Maximum clique size is 4;
 /// the best-quality image anchors each clique so small collections always
 /// contain the strongest member.
+/// Build similar-image cliques.
+///
+/// `new_asset_ids`   — content_asset IDs that are new in this scan run.
+///                     When non-empty, SSIM is only computed for candidate
+///                     pairs that involve at least one new asset.  Old pairs
+///                     are looked up in `cached_pairs` (pre-loaded from DB)
+///                     so that previously confirmed groups are preserved.
+///
+/// `cached_pairs`    — (min_id, max_id) → ssim for pairs from existing DB
+///                     groups.  Treated as already-confirmed-similar; no SSIM
+///                     computation needed.  Pass an empty map for a full
+///                     recompute (first scan or when new_asset_ids is empty).
 fn build_similar_groups(
     records: &[ActiveRecord],
     scan_progress: &Arc<Mutex<ScanProgress>>,
+    new_asset_ids: &HashSet<i64>,
+    cached_pairs: &HashMap<(i64, i64), f32>,
 ) -> Result<Vec<GroupDraft>> {
     // ── 1. Build representative set (one entry per unique content asset) ─────
     let mut representatives = Vec::new();
@@ -2090,8 +2965,22 @@ fn build_similar_groups(
         }
     }
 
-    // ── 5. Pre-load thumbnail buffers for all indices that appear in candidates
-    let needed: HashSet<usize> = candidates.iter().flat_map(|&(i, j)| [i, j]).collect();
+    // ── 5. Pre-load thumbnail buffers ─────────────────────────────────────────
+    // In incremental mode only load buffers for pairs that actually need SSIM
+    // (i.e. at least one side is a new asset).  Old-old pairs either hit the
+    // cache or are skipped, so their buffers are never read.
+    let needed: HashSet<usize> = if new_asset_ids.is_empty() {
+        candidates.iter().flat_map(|&(i, j)| [i, j]).collect()
+    } else {
+        candidates
+            .iter()
+            .filter(|&&(i, j)| {
+                new_asset_ids.contains(&representatives[i].content_asset_id)
+                    || new_asset_ids.contains(&representatives[j].content_asset_id)
+            })
+            .flat_map(|&(i, j)| [i, j])
+            .collect()
+    };
     let buffers: Vec<Option<GrayImage>> = (0..len)
         .into_par_iter()
         .map(|i| {
@@ -2104,6 +2993,11 @@ fn build_similar_groups(
         .collect();
 
     // ── 6. Evaluate SSIM on candidates in parallel ────────────────────────────
+    // Incremental mode: for pairs where both assets are old, consult
+    // `cached_pairs` instead of computing SSIM.
+    //   • If the pair is in the cache → confirmed similar; reuse similarity.
+    //   • If the pair is NOT in the cache → was previously evaluated and found
+    //     dissimilar (or never existed); skip without I/O.
     let pairs_done = AtomicUsize::new(0);
     let similar_edges: Result<Vec<Option<(i64, i64, f32)>>> = candidates
         .par_iter()
@@ -2123,6 +3017,21 @@ fn build_similar_groups(
                 return Ok(None);
             }
 
+            // Incremental: both assets are old → use cache, skip SSIM.
+            if !new_asset_ids.is_empty()
+                && !new_asset_ids.contains(&left.content_asset_id)
+                && !new_asset_ids.contains(&right.content_asset_id)
+            {
+                let key = (
+                    left.content_asset_id.min(right.content_asset_id),
+                    left.content_asset_id.max(right.content_asset_id),
+                );
+                return Ok(cached_pairs.get(&key).map(|&sim| {
+                    (left.content_asset_id, right.content_asset_id, sim)
+                }));
+            }
+
+            // New pair: compute SSIM from thumbnail buffers.
             let (Some(buf_l), Some(buf_r)) = (buffers[i].as_ref(), buffers[j].as_ref()) else {
                 return Ok(None);
             };
@@ -2282,16 +3191,29 @@ fn build_similar_groups(
 }
 
 fn build_raw_jpeg_groups(records: &[ActiveRecord]) -> Vec<GroupDraft> {
-    let mut by_stem: HashMap<String, Vec<ActiveRecord>> = HashMap::new();
+    // Key = "<lowercase parent dir>|<lowercase stem>" so that two files with the
+    // same filename stem but in completely different directories (e.g. a 2022
+    // export and a 2024 shoot that both happen to have IMG_1234) are never
+    // paired together.
+    let mut by_dir_stem: HashMap<String, Vec<ActiveRecord>> = HashMap::new();
     for record in records {
-        let stem = normalized_stem(Path::new(&record.path.replace('/', "\\")));
-        if !stem.is_empty() {
-            by_stem.entry(stem).or_default().push(record.clone());
+        let path_str = record.path.replace('/', "\\");
+        let path = Path::new(&path_str);
+        let stem = normalized_stem(path);
+        if stem.is_empty() {
+            continue;
         }
+        let parent = path
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let key = format!("{parent}|{stem}");
+        by_dir_stem.entry(key).or_default().push(record.clone());
     }
 
     let mut drafts = Vec::new();
-    for (stem, members) in by_stem {
+    for (key, members) in by_dir_stem {
         let has_raw = members
             .iter()
             .any(|member| member.extension.eq_ignore_ascii_case("rw2"));
@@ -2307,7 +3229,7 @@ fn build_raw_jpeg_groups(records: &[ActiveRecord]) -> Vec<GroupDraft> {
 
         let keep_id = pick_best_member(&members).map(|member| member.file_instance_id);
         drafts.push(GroupDraft {
-            anchor: format!("raw-jpeg:{stem}"),
+            anchor: format!("raw-jpeg:{key}"),
             kind: MatchKind::RawJpegSet,
             recommendation_reason:
                 "RAW + export pair detected. Keep both by default unless you explicitly want to discard one."
@@ -2423,6 +3345,69 @@ fn pick_best_member(records: &[ActiveRecord]) -> Option<&ActiveRecord> {
     })
 }
 
+/// Loads existing confirmed-similar pairs from the DB.
+/// Used to seed `build_similar_groups` in incremental mode so that
+/// old (old_asset, old_asset) pairs don't need SSIM recomputation.
+/// Key = (min_asset_id, max_asset_id), value = similarity score.
+fn load_existing_similar_pairs(tx: &Transaction<'_>) -> Result<HashMap<(i64, i64), f32>> {
+    let mut stmt = tx.prepare(
+        "SELECT gm1.content_asset_id, gm2.content_asset_id
+         FROM group_members gm1
+         JOIN group_members gm2
+           ON gm2.group_id = gm1.group_id
+          AND gm2.content_asset_id > gm1.content_asset_id
+         JOIN match_groups mg ON mg.id = gm1.group_id
+         WHERE mg.kind = 'similar' AND mg.status != 'applied'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut pairs = HashMap::new();
+    for row in rows {
+        let (a, b) = row?;
+        pairs.insert((a.min(b), a.max(b)), SIMILARITY_THRESHOLD);
+    }
+    Ok(pairs)
+}
+
+/// Returns IDs of similar groups that are not affected by this scan:
+///  - all members still exist on disk (exists_flag = 1)
+///  - no member's content_asset_id appears in new_asset_ids
+/// These groups are preserved as-is without recomputation.
+fn load_untouched_similar_group_ids(
+    tx: &Transaction<'_>,
+    new_asset_ids: &HashSet<i64>,
+) -> Result<HashSet<i64>> {
+    // Load (group_id, content_asset_id) for all non-applied similar groups
+    // where every member is still alive.
+    let mut stmt = tx.prepare(
+        "SELECT mg.id, gm.content_asset_id
+         FROM match_groups mg
+         JOIN group_members gm ON gm.group_id = mg.id
+         JOIN file_instances fi ON fi.id = gm.file_instance_id
+         WHERE mg.kind = 'similar'
+           AND mg.status != 'applied'
+           AND fi.exists_flag = 1",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    let mut group_assets: HashMap<i64, Vec<i64>> = HashMap::new();
+    for row in rows {
+        let (group_id, asset_id) = row?;
+        group_assets.entry(group_id).or_default().push(asset_id);
+    }
+
+    let mut preserved = HashSet::new();
+    for (group_id, asset_ids) in group_assets {
+        if !asset_ids.iter().any(|id| new_asset_ids.contains(id)) {
+            preserved.insert(group_id);
+        }
+    }
+    Ok(preserved)
+}
+
 fn load_existing_groups(tx: &Transaction<'_>) -> Result<HashMap<String, (i64, String)>> {
     let mut statement = tx.prepare("SELECT id, anchor, status FROM match_groups")?;
     let rows = statement.query_map([], |row| {
@@ -2455,7 +3440,10 @@ fn map_existing_instance(row: &Row<'_>) -> rusqlite::Result<ExistingInstance> {
 }
 
 fn map_asset_record(row: &Row<'_>) -> rusqlite::Result<AssetRecord> {
-    Ok(AssetRecord { id: row.get(0)? })
+    Ok(AssetRecord {
+        id: row.get(0)?,
+        analysis_version: row.get(1)?,
+    })
 }
 
 fn map_group_summary(row: &Row<'_>) -> rusqlite::Result<GroupSummary> {
@@ -2514,6 +3502,7 @@ mod tests {
             scan_progress: Arc::new(Mutex::new(ScanProgress::idle())),
             next_task_id: Arc::new(AtomicU64::new(1)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            last_rating_undo: Arc::new(Mutex::new(None)),
         };
         service.ensure_schema().unwrap();
         (dir, service)
@@ -2842,5 +3831,259 @@ mod tests {
             result.unwrap_err().to_string().contains("cancelled"),
             "error message should mention cancellation"
         );
+    }
+
+    // ── Photo Rating Tests ─────────────────────────────────────────────────────
+
+    fn scan_two_images(service: &AppService, root: &std::path::Path) -> GroupDetail {
+        save_test_image(&root.join("a.jpg"), 200, 200, 10).unwrap();
+        save_test_image(&root.join("b.jpg"), 200, 200, 11).unwrap();
+        service.start_scan(vec![root.to_string_lossy().to_string()]).unwrap();
+        let groups = service
+            .list_groups(ReviewGroupFilter { kind: Some(MatchKind::Exact), status: None })
+            .unwrap();
+        // Return detail for the first exact group, or construct a minimal detail
+        // using the first two file instances.
+        if let Some(g) = groups.first() {
+            return service.get_group(g.id).unwrap();
+        }
+        // No duplicate group (images are distinct) — return a mock using any two instances
+        let conn = service.open().unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM file_instances ORDER BY id LIMIT 2")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        // Return a dummy GroupDetail just to expose two file_instance_ids for rating tests
+        GroupDetail {
+            id: 0,
+            kind: MatchKind::Exact,
+            status: ReviewStatus::Pending,
+            anchor: "test".into(),
+            recommendation_reason: String::new(),
+            recommended_keep_instance_id: None,
+            members: ids
+                .into_iter()
+                .map(|id| GroupMember {
+                    group_member_id: 0,
+                    file_instance_id: id,
+                    content_asset_id: 0,
+                    path: String::new(),
+                    exists_flag: true,
+                    extension: "jpg".into(),
+                    format_name: None,
+                    width: None,
+                    height: None,
+                    quality_score: None,
+                    preview_supported: false,
+                    thumbnail_path: None,
+                    sha256: String::new(),
+                    similarity: None,
+                    role: None,
+                    captured_at: None,
+                    volume_id: None,
+                    user_rating: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn rating_set_and_read_back() {
+        let (workspace, service) = create_test_service();
+        let root = workspace.path().join("photos");
+        fs::create_dir_all(&root).unwrap();
+        let detail = scan_two_images(&service, &root);
+        let fid = detail.members[0].file_instance_id;
+
+        let result = service.set_rating(fid, 4, Some("nice shot".to_string())).unwrap();
+        assert_eq!(result.file_instance_id, fid);
+        assert_eq!(result.rating, 4);
+        assert_eq!(result.note.as_deref(), Some("nice shot"));
+
+        // Re-open and read back via get_group or direct query
+        let conn = service.open().unwrap();
+        let stored: i32 = conn
+            .query_row(
+                "SELECT rating FROM photo_ratings WHERE file_instance_id = ?1",
+                [fid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 4);
+    }
+
+    #[test]
+    fn rating_persists_after_reopen() {
+        let (workspace, service) = create_test_service();
+        let root = workspace.path().join("photos");
+        fs::create_dir_all(&root).unwrap();
+        let detail = scan_two_images(&service, &root);
+        let fid = detail.members[0].file_instance_id;
+
+        service.set_rating(fid, 3, None).unwrap();
+
+        // Simulate restart: create a new service pointing at the same DB
+        let service2 = AppService {
+            db_path: service.db_path.clone(),
+            thumbs_dir: service.thumbs_dir.clone(),
+            scan_progress: Arc::new(Mutex::new(ScanProgress::idle())),
+            next_task_id: Arc::new(AtomicU64::new(1)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            last_rating_undo: Arc::new(Mutex::new(None)),
+        };
+        service2.ensure_schema().unwrap();
+
+        let conn = service2.open().unwrap();
+        let stored: i32 = conn
+            .query_row(
+                "SELECT rating FROM photo_ratings WHERE file_instance_id = ?1",
+                [fid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 3);
+    }
+
+    #[test]
+    fn rating_repeated_set_overwrites_not_duplicates() {
+        let (workspace, service) = create_test_service();
+        let root = workspace.path().join("photos");
+        fs::create_dir_all(&root).unwrap();
+        let detail = scan_two_images(&service, &root);
+        let fid = detail.members[0].file_instance_id;
+
+        service.set_rating(fid, 2, None).unwrap();
+        service.set_rating(fid, 5, Some("updated".to_string())).unwrap();
+
+        let conn = service.open().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM photo_ratings WHERE file_instance_id = ?1",
+                [fid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "must have exactly one row, not duplicated");
+
+        let rating: i32 = conn
+            .query_row(
+                "SELECT rating FROM photo_ratings WHERE file_instance_id = ?1",
+                [fid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rating, 5);
+    }
+
+    #[test]
+    fn rating_undo_restores_previous_state() {
+        let (workspace, service) = create_test_service();
+        let root = workspace.path().join("photos");
+        fs::create_dir_all(&root).unwrap();
+        let detail = scan_two_images(&service, &root);
+        let fid = detail.members[0].file_instance_id;
+
+        // Set initial rating then change it
+        service.set_rating(fid, 2, None).unwrap();
+        service.set_rating(fid, 5, None).unwrap();
+
+        // Undo should restore to 2
+        let restored = service.undo_rating().unwrap();
+        assert!(restored.is_some());
+        assert_eq!(restored.unwrap().rating, 2);
+
+        // Undo on a fresh rating should delete the row
+        service.set_rating(fid, 4, None).unwrap();
+        // Simulate "undo" of first-ever rating (fid was unrated before set_rating(2))
+        // We need to set it fresh: reopen service to clear undo state
+        let service2 = AppService {
+            db_path: service.db_path.clone(),
+            thumbs_dir: service.thumbs_dir.clone(),
+            scan_progress: Arc::new(Mutex::new(ScanProgress::idle())),
+            next_task_id: Arc::new(AtomicU64::new(1)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            last_rating_undo: Arc::new(Mutex::new(None)),
+        };
+        service2.ensure_schema().unwrap();
+        // fid has rating=2 right now (after undo), then we get a fresh first-time rating
+        // Delete rating to simulate unrated state
+        service2.open().unwrap().execute(
+            "DELETE FROM photo_ratings WHERE file_instance_id = ?1",
+            [fid],
+        ).unwrap();
+        service2.set_rating(fid, 1, None).unwrap();
+        let deleted = service2.undo_rating().unwrap();
+        assert!(deleted.is_none(), "undoing first-ever rating should return None");
+        let count: i64 = service2.open().unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM photo_ratings WHERE file_instance_id = ?1",
+                [fid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "row must be deleted after undoing first-ever rating");
+    }
+
+    #[test]
+    fn rating_group_detail_includes_user_rating() {
+        let (workspace, service) = create_test_service();
+        let root = workspace.path().join("photos");
+        fs::create_dir_all(&root).unwrap();
+
+        // Create an exact duplicate pair so we have a real group
+        let img_a = root.join("orig.jpg");
+        let img_b = root.join("copy.jpg");
+        save_test_image(&img_a, 200, 200, 42).unwrap();
+        fs::copy(&img_a, &img_b).unwrap();
+
+        service.start_scan(vec![root.to_string_lossy().to_string()]).unwrap();
+        let groups = service
+            .list_groups(ReviewGroupFilter { kind: Some(MatchKind::Exact), status: None })
+            .unwrap();
+        assert!(!groups.is_empty(), "should detect exact duplicate group");
+
+        let detail = service.get_group(groups[0].id).unwrap();
+        let fid = detail.members[0].file_instance_id;
+
+        // Initially unrated
+        assert!(detail.members[0].user_rating.is_none());
+
+        // Set rating and reload group
+        service.set_rating(fid, 3, None).unwrap();
+        let detail2 = service.get_group(groups[0].id).unwrap();
+        let member = detail2.members.iter().find(|m| m.file_instance_id == fid).unwrap();
+        assert_eq!(member.user_rating, Some(3));
+    }
+
+    #[test]
+    fn rating_works_for_exact_and_similar_groups() {
+        let (workspace, service) = create_test_service();
+        let root = workspace.path().join("photos");
+        fs::create_dir_all(&root).unwrap();
+
+        // Exact duplicate pair
+        let img_a = root.join("exact_a.jpg");
+        let img_b = root.join("exact_b.jpg");
+        save_test_image(&img_a, 200, 200, 7).unwrap();
+        fs::copy(&img_a, &img_b).unwrap();
+
+        service.start_scan(vec![root.to_string_lossy().to_string()]).unwrap();
+
+        let exact_groups = service
+            .list_groups(ReviewGroupFilter { kind: Some(MatchKind::Exact), status: None })
+            .unwrap();
+        assert!(!exact_groups.is_empty());
+
+        let detail = service.get_group(exact_groups[0].id).unwrap();
+        let fid = detail.members[0].file_instance_id;
+        let r = service.set_rating(fid, 5, None).unwrap();
+        assert_eq!(r.rating, 5);
+
+        // Verify it's readable back
+        let detail2 = service.get_group(exact_groups[0].id).unwrap();
+        assert!(detail2.members.iter().any(|m| m.user_rating == Some(5)));
     }
 }

@@ -99,6 +99,45 @@ export interface GroupMember {
   role: string | null;
   capturedAt: string | null;
   volumeId: string | null;
+  userRating: number | null;
+}
+
+export interface RatedPhoto {
+  fileInstanceId: number;
+  contentAssetId: number;
+  path: string;
+  extension: string;
+  formatName: string | null;
+  width: number | null;
+  height: number | null;
+  qualityScore: number | null;
+  previewSupported: boolean;
+  thumbnailPath: string | null;
+  userRating: number | null;
+}
+
+export interface RatedPhotoPage {
+  photos: RatedPhoto[];
+  total: number;
+}
+
+export interface RatingPhotoFilter {
+  unratedOnly: boolean;
+  minRating: number | null;
+}
+
+export interface PhotoRating {
+  fileInstanceId: number;
+  rating: number;
+  flagged: boolean;
+  note: string | null;
+  updatedAt: string;
+}
+
+export interface SetRatingPayload {
+  fileInstanceId: number;
+  rating: number;
+  note?: string | null;
 }
 
 export interface GroupDetail {
