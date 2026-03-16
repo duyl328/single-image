@@ -22,6 +22,7 @@ import {
   loadScanStatus,
   loadSnapshot,
   loadUnknownFormats,
+  recycleRatedPhoto,
   setRating,
   startScan,
   undoRating,
@@ -139,7 +140,11 @@ function BufferedPreviewImage(
     };
   }, [resolvedSrc, src]);
 
-  return <img {...imgProps} src={resolvedSrc} />;
+  return <img {...imgProps} src={resolvedSrc} draggable={false} />;
+}
+
+function sameRatingFilter(a: RatingPhotoFilter, b: RatingPhotoFilter) {
+  return a.unratedOnly === b.unratedOnly && a.minRating === b.minRating;
 }
 
 function App() {
@@ -179,9 +184,12 @@ function App() {
     minRating: null,
   });
   const [ratingLoading, setRatingLoading] = useState(false);
+  const [ratingLoadingMore, setRatingLoadingMore] = useState(false);
+  const [ratingHasMore, setRatingHasMore] = useState(false);
   const [ratings, setRatings] = useState<Map<number, number | null>>(new Map());
   const [previewMode, setPreviewMode] = useState<"fit" | "actual">("fit");
   const [previewScale, setPreviewScale] = useState(1);
+  const [isPreviewDragging, setIsPreviewDragging] = useState(false);
   const [ratingImmersive, setRatingImmersive] = useState(false);
   const [ratingListVisible, setRatingListVisible] = useState(true);
   const previewModeRef = useRef(previewMode);
@@ -192,13 +200,46 @@ function App() {
   ratingPhotoIdxRef.current = ratingPhotoIdx;
   const ratingPhotosRef = useRef(ratingPhotos);
   ratingPhotosRef.current = ratingPhotos;
+  const ratingTotalRef = useRef(ratingTotal);
+  ratingTotalRef.current = ratingTotal;
+  const ratingFilterRef = useRef(ratingFilter);
+  ratingFilterRef.current = ratingFilter;
   const ratingListScrollRef = useRef<HTMLDivElement | null>(null);
   const ratingItemRefs = useRef(new Map<number, HTMLButtonElement>());
+  const previewScrollRef = useRef<HTMLDivElement | null>(null);
+  const compareCurrentPaneRef = useRef<HTMLDivElement | null>(null);
+  const comparePeerPaneRef = useRef<HTMLDivElement | null>(null);
+  const previewDragRef = useRef<{
+    active: boolean;
+    startX: number;
+    startY: number;
+    targets: Array<{ element: HTMLDivElement; left: number; top: number }>;
+  }>({
+    active: false,
+    startX: 0,
+    startY: 0,
+    targets: [],
+  });
   const PAGE_SIZE = 500;
+  const ratingCurrentPhoto = ratingPhotos[ratingPhotoIdx] ?? null;
+  const ratingPrevPhoto = ratingPhotoIdx > 0 ? ratingPhotos[ratingPhotoIdx - 1] : null;
+  const ratingNextPhoto = ratingPhotoIdx < ratingPhotos.length - 1
+    ? ratingPhotos[ratingPhotoIdx + 1]
+    : null;
+  const ratingComparePhoto = ratingNextPhoto ?? ratingPrevPhoto ?? null;
+  const showDualPortraitCompare = Boolean(
+    previewMode === "fit"
+    && ratingCurrentPhoto
+    && ratingCurrentPhoto.width
+    && ratingCurrentPhoto.height
+    && ratingCurrentPhoto.height > ratingCurrentPhoto.width
+    && ratingComparePhoto,
+  );
+  const isPreviewPannable = previewMode === "actual" || previewScale > 1;
 
   useEffect(() => {
     if (activeTab !== "rating") return;
-    void loadRatingPhotoPage(ratingFilter, 0);
+    void loadRatingPhotoPage(ratingFilter, 0, { append: false });
   }, [activeTab, ratingFilter]);
 
   useEffect(() => {
@@ -232,10 +273,6 @@ function App() {
       void preloadPreviewImage(src).catch(() => undefined);
     });
   }, [activeTab, ratingPhotoIdx, ratingPhotos]);
-
-  useEffect(() => {
-    void refreshDashboard();
-  }, [filterKind, filterStatus]);
 
   useEffect(() => {
     if (selectedGroupId == null) {
@@ -305,7 +342,7 @@ function App() {
     );
   });
 
-  async function refreshDashboard() {
+  const refreshDashboard = useCallback(async () => {
     try {
       setError(null);
       const [nextSnapshot, nextGroups, nextActions] = await Promise.all([
@@ -327,7 +364,11 @@ function App() {
     } catch (reason) {
       setError(String(reason));
     }
-  }
+  }, [filterKind, filterStatus]);
+
+  useEffect(() => {
+    void refreshDashboard();
+  }, [refreshDashboard]);
 
   async function handlePickFolders() {
     try {
@@ -419,13 +460,35 @@ function App() {
     ? selectedGroup.members.length - pendingRecycleCount
     : 0;
 
-  async function loadRatingPhotoPage(filter: RatingPhotoFilter, offset: number) {
-    setRatingLoading(true);
+  async function loadRatingPhotoPage(
+    filter: RatingPhotoFilter,
+    offset: number,
+    options?: { append?: boolean },
+  ) {
+    const append = options?.append ?? false;
+    if (append) {
+      setRatingLoadingMore(true);
+    } else {
+      setRatingLoading(true);
+      setRatingHasMore(false);
+    }
     try {
       const page = await listRatedPhotos(filter, offset, PAGE_SIZE);
-      setRatingPhotos(page.photos);
+      if (!sameRatingFilter(filter, ratingFilterRef.current)) {
+        return;
+      }
+
+      const nextPhotos = append
+        ? [...ratingPhotosRef.current, ...page.photos].filter((photo, idx, all) =>
+          all.findIndex((candidate) => candidate.fileInstanceId === photo.fileInstanceId) === idx)
+        : page.photos;
+
+      setRatingPhotos(nextPhotos);
       setRatingTotal(page.total);
-      setRatingPhotoIdx(0);
+      setRatingHasMore(nextPhotos.length < page.total);
+      if (!append) {
+        setRatingPhotoIdx(0);
+      }
       setRatings((prev) => {
         const next = new Map(prev);
         page.photos.forEach((photo) => {
@@ -438,7 +501,11 @@ function App() {
     } catch (reason) {
       setError(String(reason));
     } finally {
-      setRatingLoading(false);
+      if (append) {
+        setRatingLoadingMore(false);
+      } else {
+        setRatingLoading(false);
+      }
     }
   }
 
@@ -450,10 +517,176 @@ function App() {
     setPreviewScale((current) => clampPreviewScale(current + delta));
   }
 
+  const getPreviewScrollElements = useCallback(() => (
+    showDualPortraitCompare
+      ? [compareCurrentPaneRef.current, comparePeerPaneRef.current].filter(
+        (pane): pane is HTMLDivElement => pane != null,
+      )
+      : previewScrollRef.current
+        ? [previewScrollRef.current]
+        : []
+  ), [showDualPortraitCompare]);
+
+  const stopPreviewDrag = useCallback(() => {
+    if (!previewDragRef.current.active) return;
+    previewDragRef.current.active = false;
+    previewDragRef.current.targets = [];
+    setIsPreviewDragging(false);
+    document.body.style.userSelect = "";
+    document.body.style.cursor = "";
+  }, []);
+
+  const handlePreviewMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || !isPreviewPannable) return;
+
+    const targets = getPreviewScrollElements();
+
+    if (targets.length === 0) return;
+
+    const scrollTargets = targets.map((element) => ({
+      element,
+      left: element.scrollLeft,
+      top: element.scrollTop,
+    }));
+    const hasOverflow = scrollTargets.some(({ element }) =>
+      element.scrollWidth > element.clientWidth + 1
+      || element.scrollHeight > element.clientHeight + 1);
+
+    if (!hasOverflow) return;
+
+    event.preventDefault();
+    previewDragRef.current = {
+      active: true,
+      startX: event.clientX,
+      startY: event.clientY,
+      targets: scrollTargets,
+    };
+    setIsPreviewDragging(true);
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "grabbing";
+  }, [getPreviewScrollElements, isPreviewPannable]);
+
+  function removeRatingPhotoFromState(fileInstanceId: number) {
+    const currentPhotos = ratingPhotosRef.current;
+    const currentTotal = ratingTotalRef.current;
+    const removedIdx = currentPhotos.findIndex((photo) => photo.fileInstanceId === fileInstanceId);
+    if (removedIdx === -1) return;
+
+    const nextPhotos = currentPhotos.filter((photo) => photo.fileInstanceId !== fileInstanceId);
+    setRatingPhotos(nextPhotos);
+    setRatingTotal((current) => Math.max(0, current - 1));
+    setRatingHasMore(nextPhotos.length < Math.max(0, currentTotal - 1));
+    setSnapshot((current) => current
+      ? { ...current, activeFileCount: Math.max(0, current.activeFileCount - 1) }
+      : current);
+    setRatingPhotoIdx((current) => {
+      if (nextPhotos.length === 0) return 0;
+      if (current > removedIdx) return current - 1;
+      return Math.min(current, nextPhotos.length - 1);
+    });
+  }
+
+  const handleRecycleCurrentPhoto = useCallback(async (
+    photo = ratingPhotosRef.current[ratingPhotoIdxRef.current],
+  ) => {
+    if (!photo) return;
+
+    try {
+      setError(null);
+      await recycleRatedPhoto({ fileInstanceId: photo.fileInstanceId });
+      setRatings((prev) => new Map(prev).set(photo.fileInstanceId, 0));
+      removeRatingPhotoFromState(photo.fileInstanceId);
+      void refreshDashboard();
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }, [refreshDashboard]);
+
   const handlePreviewWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
     event.preventDefault();
-    adjustPreviewScale(event.deltaY < 0 ? 0.1 : -0.1);
+    const currentScale = previewScaleRef.current;
+    const nextScale = clampPreviewScale(currentScale + (event.deltaY < 0 ? 0.1 : -0.1));
+    if (nextScale === currentScale) return;
+
+    const targets = getPreviewScrollElements();
+    const hoveredElement = (event.target as HTMLElement | null)?.closest(
+      ".rating-preview-compare-pane, .rating-preview-img-wrap",
+    ) as HTMLDivElement | null;
+    const anchorRect = hoveredElement?.getBoundingClientRect() ?? event.currentTarget.getBoundingClientRect();
+    const anchorRatioX = anchorRect.width > 0
+      ? Math.min(1, Math.max(0, (event.clientX - anchorRect.left) / anchorRect.width))
+      : 0.5;
+    const anchorRatioY = anchorRect.height > 0
+      ? Math.min(1, Math.max(0, (event.clientY - anchorRect.top) / anchorRect.height))
+      : 0.5;
+    const scaleRatio = nextScale / currentScale;
+    const scrollAnchors = targets.map((element) => {
+      const viewportX = anchorRatioX * element.clientWidth;
+      const viewportY = anchorRatioY * element.clientHeight;
+      return {
+        element,
+        viewportX,
+        viewportY,
+        contentX: element.scrollLeft + viewportX,
+        contentY: element.scrollTop + viewportY,
+      };
+    });
+
+    setPreviewScale(nextScale);
+    requestAnimationFrame(() => {
+      scrollAnchors.forEach(({ element, viewportX, viewportY, contentX, contentY }) => {
+        element.scrollLeft = contentX * scaleRatio - viewportX;
+        element.scrollTop = contentY * scaleRatio - viewportY;
+      });
+    });
+  }, [getPreviewScrollElements]);
+
+  const handlePreviewDoubleClick = useCallback(() => {
+    setPreviewScale(1);
   }, []);
+
+  const handleRatingListScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    if (ratingLoading || ratingLoadingMore || !ratingHasMore) return;
+
+    const element = event.currentTarget;
+    const remaining = element.scrollHeight - element.scrollTop - element.clientHeight;
+    if (remaining > 240) return;
+
+    void loadRatingPhotoPage(ratingFilterRef.current, ratingPhotosRef.current.length, {
+      append: true,
+    });
+  }, [ratingHasMore, ratingLoading, ratingLoadingMore]);
+
+  useEffect(() => {
+    function handleMouseMove(event: MouseEvent) {
+      const state = previewDragRef.current;
+      if (!state.active) return;
+
+      const deltaX = event.clientX - state.startX;
+      const deltaY = event.clientY - state.startY;
+
+      state.targets.forEach(({ element, left, top }) => {
+        element.scrollLeft = left - deltaX;
+        element.scrollTop = top - deltaY;
+      });
+    }
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", stopPreviewDrag);
+    window.addEventListener("mouseleave", stopPreviewDrag);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", stopPreviewDrag);
+      window.removeEventListener("mouseleave", stopPreviewDrag);
+      stopPreviewDrag();
+    };
+  }, [stopPreviewDrag]);
+
+  useEffect(() => {
+    if (!isPreviewPannable) {
+      stopPreviewDrag();
+    }
+  }, [isPreviewPannable, stopPreviewDrag]);
 
   const handleRatingKey = useCallback((key: string) => {
     const photos = ratingPhotosRef.current;
@@ -484,11 +717,14 @@ function App() {
     if (key === "u" || key === "U") {
       void undoRating().then((restored) => {
         if (restored) {
-          setRatings((prev) => new Map(prev).set(restored.fileInstanceId, restored.rating));
-        } else if (currentPhoto) {
-          setRatings((prev) => new Map(prev).set(currentPhoto.fileInstanceId, null));
+          setRatings((prev) =>
+            new Map(prev).set(restored.fileInstanceId, restored.restoredRating));
         }
       });
+      return;
+    }
+    if (key === "Delete") {
+      void handleRecycleCurrentPhoto(currentPhoto);
       return;
     }
     if (key === "z" || key === "Z") {
@@ -518,7 +754,7 @@ function App() {
     if (key === "l" || key === "L") {
       setRatingListVisible((visible) => !visible);
     }
-  }, []);
+  }, [handleRecycleCurrentPhoto]);
 
   useEffect(() => {
     if (activeTab !== "rating") return;
@@ -1042,14 +1278,12 @@ function App() {
   // ─── History Tab ─────────────────────────────────────────────────────────────
 
   function renderRatingTab() {
-    const currentPhoto = ratingPhotos[ratingPhotoIdx] ?? null;
+    const currentPhoto = ratingCurrentPhoto;
     const filename = currentPhoto
       ? currentPhoto.path.split(/[\\/]/).pop() ?? currentPhoto.path
       : null;
-    const prevPhoto = ratingPhotoIdx > 0 ? ratingPhotos[ratingPhotoIdx - 1] : null;
-    const nextPhoto = ratingPhotoIdx < ratingPhotos.length - 1
-      ? ratingPhotos[ratingPhotoIdx + 1]
-      : null;
+    const prevPhoto = ratingPrevPhoto;
+    const nextPhoto = ratingNextPhoto;
 
     function getPhotoRating(fid: number): number | null {
       if (ratings.has(fid)) return ratings.get(fid) ?? null;
@@ -1057,15 +1291,7 @@ function App() {
     }
 
     const currentRating = currentPhoto ? getPhotoRating(currentPhoto.fileInstanceId) : null;
-    const comparePhoto = nextPhoto ?? prevPhoto ?? null;
-    const showDualPortraitCompare = Boolean(
-      previewMode === "fit"
-      && currentPhoto
-      && currentPhoto.width
-      && currentPhoto.height
-      && currentPhoto.height > currentPhoto.width
-      && comparePhoto,
-    );
+    const comparePhoto = ratingComparePhoto;
     const comparePhotoId = showDualPortraitCompare ? comparePhoto?.fileInstanceId ?? null : null;
 
     const filterChips: Array<{ label: string; filter: RatingPhotoFilter }> = [
@@ -1093,6 +1319,7 @@ function App() {
         <div className={`rating-hint-bar ${ratingImmersive ? "rating-hint-bar--immersive" : ""}`}>
           <span className="rating-hint"><kbd>0-5</kbd> 评分</span>
           <span className="rating-hint"><kbd>←</kbd><kbd>→</kbd> 切换</span>
+          <span className="rating-hint"><kbd>Del</kbd> 回收</span>
           <span className="rating-hint"><kbd>U</kbd> 撤销</span>
           <span className="rating-hint"><kbd>Z</kbd> 缩放</span>
           <span className="rating-hint">滚轮缩放</span>
@@ -1157,12 +1384,12 @@ function App() {
           {!ratingLoading && (
             <span className="rating-total">
               {ratingTotal.toLocaleString()} items
-              {ratingPhotos.length < ratingTotal && ` (showing first ${ratingPhotos.length})`}
+              {ratingPhotos.length < ratingTotal && ` (已加载 ${ratingPhotos.length})`}
             </span>
           )}
           <button
             className="btn btn--ghost btn--sm"
-            onClick={() => void loadRatingPhotoPage(ratingFilter, 0)}
+            onClick={() => void loadRatingPhotoPage(ratingFilter, 0, { append: false })}
           >
             刷新
           </button>
@@ -1182,7 +1409,11 @@ function App() {
               ))}
             </div>
 
-            <div className="rating-photo-scroll" ref={ratingListScrollRef}>
+            <div
+              className="rating-photo-scroll"
+              ref={ratingListScrollRef}
+              onScroll={handleRatingListScroll}
+            >
               {ratingPhotos.length === 0 && !ratingLoading ? (
                 <div className="empty-state empty-state--compact">
                   <p className="empty-state-title">
@@ -1195,7 +1426,8 @@ function App() {
                   </p>
                 </div>
               ) : (
-                ratingPhotos.map((photo, idx) => {
+                <>
+                  {ratingPhotos.map((photo, idx) => {
                   const ratingValue = getPhotoRating(photo.fileInstanceId);
                   const photoName = photo.path.split(/[\\/]/).pop() ?? photo.path;
                   return (
@@ -1232,7 +1464,11 @@ function App() {
                       </div>
                     </button>
                   );
-                })
+                  })}
+                  {ratingLoadingMore && (
+                    <div className="rating-list-loading-more">正在加载更多照片...</div>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -1241,13 +1477,21 @@ function App() {
             {currentPhoto ? (
               <>
                 <div
-                  className={`rating-preview-img-wrap rating-preview-img-wrap--${previewMode}`}
+                  ref={previewScrollRef}
+                  className={`rating-preview-img-wrap rating-preview-img-wrap--${previewMode} ${
+                    isPreviewPannable ? "rating-preview-img-wrap--pannable" : ""
+                  } ${isPreviewDragging ? "rating-preview-img-wrap--dragging" : ""}`}
                   onWheel={handlePreviewWheel}
+                  onMouseDown={handlePreviewMouseDown}
+                  onDoubleClick={handlePreviewDoubleClick}
                   style={{ ["--preview-scale" as string]: previewScale } as CSSProperties}
                 >
                   {showDualPortraitCompare ? (
                     <div className="rating-preview-compare">
-                      <div className="rating-preview-compare-pane">
+                      <div
+                        ref={compareCurrentPaneRef}
+                        className="rating-preview-compare-pane"
+                      >
                         <div className="rating-preview-compare-label">当前</div>
                         {currentPhoto.previewSupported ? (
                           <BufferedPreviewImage
@@ -1262,7 +1506,10 @@ function App() {
                           </div>
                         )}
                       </div>
-                      <div className="rating-preview-compare-pane">
+                      <div
+                        ref={comparePeerPaneRef}
+                        className="rating-preview-compare-pane"
+                      >
                         <div className="rating-preview-compare-label">对比</div>
                         {comparePhoto?.previewSupported ? (
                           <BufferedPreviewImage
@@ -1342,6 +1589,13 @@ function App() {
                     <span className="rating-score-label">
                       {currentRating != null && currentRating > 0 ? `${currentRating} 星` : "未评分"}
                     </span>
+                    <button
+                      className="rating-clear-btn rating-delete-btn"
+                      onClick={() => void handleRecycleCurrentPhoto(currentPhoto)}
+                      title="移动到回收站并记为 0 分 (Delete)"
+                    >
+                      删除到回收站
+                    </button>
                   </div>
 
                   <div className="rating-nav-row">

@@ -9,6 +9,8 @@ import type {
   PathHistoryItem,
   PhotoRating,
   RatedPhotoPage,
+  RatingUndoResult,
+  RecycleRatedPhotoPayload,
   RatingPhotoFilter,
   ReviewActionSummary,
   ReviewGroupFilter,
@@ -65,7 +67,11 @@ export function setRating(payload: SetRatingPayload) {
 }
 
 export function undoRating() {
-  return invoke<PhotoRating | null>("rating_undo");
+  return invoke<RatingUndoResult | null>("rating_undo");
+}
+
+export function recycleRatedPhoto(payload: RecycleRatedPhotoPayload) {
+  return invoke<PhotoRating>("rating_recycle_photo", { payload });
 }
 
 export function listRatedPhotos(

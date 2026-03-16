@@ -27,7 +27,7 @@ use crate::image_tools::{
 use crate::models::{
     AppSnapshot, DecisionPayload, GroupDetail, GroupMember, GroupSummary, GroupingProgress,
     MatchKind, PathHistoryItem, PhotoRating, RatedPhoto, RatedPhotoPage, RatingPhotoFilter,
-    ReviewActionSummary, ReviewGroupFilter, ReviewStatus,
+    RatingUndoResult, ReviewActionSummary, ReviewGroupFilter, ReviewStatus,
     ScanActiveItem, ScanProgress, ScanRecentItem, ScanResult, ScanTaskStarted, ScanTaskStatus,
     UnknownFormatSummary,
 };
@@ -1528,9 +1528,8 @@ impl AppService {
         })
     }
 
-    /// Undo the last `set_rating` call.  Returns the restored rating (or None
-    /// if the file was unrated before and the rating row was deleted).
-    pub fn undo_rating(&self) -> Result<Option<PhotoRating>> {
+    /// Undo the last `set_rating` call and always report which file was restored.
+    pub fn undo_rating(&self) -> Result<Option<RatingUndoResult>> {
         let undo_state = {
             let mut undo = self
                 .last_rating_undo
@@ -1553,7 +1552,11 @@ impl AppService {
                     "DELETE FROM photo_ratings WHERE file_instance_id = ?1",
                     [file_instance_id],
                 )?;
-                Ok(None)
+                Ok(Some(RatingUndoResult {
+                    file_instance_id,
+                    restored_rating: None,
+                    updated_at,
+                }))
             }
             Some(prev) => {
                 conn.execute(
@@ -1565,15 +1568,79 @@ impl AppService {
                        updated_at = excluded.updated_at",
                     params![file_instance_id, prev, updated_at.clone()],
                 )?;
-                Ok(Some(PhotoRating {
+                Ok(Some(RatingUndoResult {
                     file_instance_id,
-                    rating: prev,
-                    flagged: false,
-                    note: None,
+                    restored_rating: Some(prev),
                     updated_at,
                 }))
             }
         }
+    }
+
+    /// Move one photo to the recycle bin from the rating workflow and persist a 0-star rating.
+    pub fn recycle_rated_photo(&self, file_instance_id: i64) -> Result<PhotoRating> {
+        let mut conn = self.open()?;
+        let current_path: String = conn
+            .query_row(
+                "SELECT current_path
+                 FROM file_instances
+                 WHERE id = ?1 AND exists_flag = 1 AND file_class = 'image'",
+                [file_instance_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("photo not found or already removed"))?;
+
+        let previous: Option<i32> = conn
+            .query_row(
+                "SELECT rating FROM photo_ratings WHERE file_instance_id = ?1",
+                [file_instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let fs_path = PathBuf::from(&current_path);
+        if fs_path.exists() {
+            trash::delete(&fs_path)
+                .with_context(|| format!("unable to move {:?} to recycle bin", fs_path))?;
+        }
+
+        {
+            let mut undo = self
+                .last_rating_undo
+                .lock()
+                .map_err(|_| anyhow!("undo lock poisoned"))?;
+            *undo = Some((file_instance_id, previous));
+        }
+
+        let updated_at = iso_now();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE file_instances
+             SET exists_flag = 0,
+                 last_seen_at = ?2
+             WHERE id = ?1",
+            params![file_instance_id, updated_at.clone()],
+        )?;
+        tx.execute(
+            "INSERT INTO photo_ratings (file_instance_id, rating, note, updated_at)
+             VALUES (?1, 0, NULL, ?2)
+             ON CONFLICT(file_instance_id) DO UPDATE SET
+               rating     = excluded.rating,
+               note       = excluded.note,
+               updated_at = excluded.updated_at",
+            params![file_instance_id, updated_at.clone()],
+        )?;
+        prune_stale_group_members(&tx)?;
+        tx.commit()?;
+
+        Ok(PhotoRating {
+            file_instance_id,
+            rating: 0,
+            flagged: false,
+            note: None,
+            updated_at,
+        })
     }
 
     /// Return a paginated list of all indexed image file instances with their ratings.
@@ -3993,7 +4060,9 @@ mod tests {
         // Undo should restore to 2
         let restored = service.undo_rating().unwrap();
         assert!(restored.is_some());
-        assert_eq!(restored.unwrap().rating, 2);
+        let restored = restored.unwrap();
+        assert_eq!(restored.file_instance_id, fid);
+        assert_eq!(restored.restored_rating, Some(2));
 
         // Undo on a fresh rating should delete the row
         service.set_rating(fid, 4, None).unwrap();
@@ -4016,7 +4085,10 @@ mod tests {
         ).unwrap();
         service2.set_rating(fid, 1, None).unwrap();
         let deleted = service2.undo_rating().unwrap();
-        assert!(deleted.is_none(), "undoing first-ever rating should return None");
+        assert!(deleted.is_some(), "undoing first-ever rating should identify the target row");
+        let deleted = deleted.unwrap();
+        assert_eq!(deleted.file_instance_id, fid);
+        assert_eq!(deleted.restored_rating, None);
         let count: i64 = service2.open().unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM photo_ratings WHERE file_instance_id = ?1",

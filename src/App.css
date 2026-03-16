@@ -1748,6 +1748,13 @@ button, input, textarea {
   overflow-y: auto;
 }
 
+.rating-list-loading-more {
+  padding: var(--s3) var(--s2) var(--s4);
+  text-align: center;
+  font-size: 0.74rem;
+  color: var(--text-3);
+}
+
 .rating-photo-item {
   display: flex;
   align-items: center;
@@ -1844,6 +1851,22 @@ button, input, textarea {
   position: relative;
 }
 
+.rating-preview-img-wrap--pannable {
+  cursor: grab;
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.rating-preview-img-wrap--dragging,
+.rating-preview-img-wrap--dragging .rating-preview-compare-pane {
+  cursor: grabbing;
+}
+
+.rating-preview-img-wrap--pannable .rating-preview-compare-pane {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
 .rating-preview-compare {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1880,6 +1903,8 @@ button, input, textarea {
   display: block;
   border-radius: var(--r-md);
   box-shadow: var(--shadow-lg);
+  user-select: none;
+  -webkit-user-drag: none;
 }
 
 /* Fit mode: 绝对定位填满容器，object-fit 等比缩放 */
@@ -2107,6 +2132,19 @@ button, input, textarea {
 }
 
 .rating-clear-btn:hover {
+  color: var(--recycle-text);
+  border-color: var(--recycle-border);
+}
+
+.rating-delete-btn {
+  margin-left: auto;
+  color: var(--recycle-text);
+  border-color: var(--recycle-border);
+  background: var(--recycle-bg);
+}
+
+.rating-delete-btn:hover {
+  background: rgba(185, 28, 28, 0.12);
   color: var(--recycle-text);
   border-color: var(--recycle-border);
 }

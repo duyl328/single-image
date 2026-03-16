@@ -134,10 +134,20 @@ export interface PhotoRating {
   updatedAt: string;
 }
 
+export interface RatingUndoResult {
+  fileInstanceId: number;
+  restoredRating: number | null;
+  updatedAt: string;
+}
+
 export interface SetRatingPayload {
   fileInstanceId: number;
   rating: number;
   note?: string | null;
+}
+
+export interface RecycleRatedPhotoPayload {
+  fileInstanceId: number;
 }
 
 export interface GroupDetail {

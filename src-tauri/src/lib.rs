@@ -6,8 +6,9 @@ mod models;
 use app::{AppService, DecisionResult};
 use models::{
     AppSnapshot, DecisionPayload, GroupDetail, GroupSummary, PathHistoryItem, PhotoRating,
-    RatedPhotoPage, RatingPhotoFilter, ReviewActionSummary, ReviewGroupFilter, ScanProgress,
-    ScanTaskStarted, SetRatingPayload, UnknownFormatSummary,
+    RatedPhotoPage, RatingPhotoFilter, RatingUndoResult, RecycleRatedPhotoPayload,
+    ReviewActionSummary, ReviewGroupFilter, ScanProgress, ScanTaskStarted, SetRatingPayload,
+    UnknownFormatSummary,
 };
 use tauri::Manager;
 
@@ -106,8 +107,18 @@ fn rating_set(
 }
 
 #[tauri::command]
-fn rating_undo(service: tauri::State<'_, AppService>) -> Result<Option<PhotoRating>, String> {
+fn rating_undo(service: tauri::State<'_, AppService>) -> Result<Option<RatingUndoResult>, String> {
     service.undo_rating().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn rating_recycle_photo(
+    service: tauri::State<'_, AppService>,
+    payload: RecycleRatedPhotoPayload,
+) -> Result<PhotoRating, String> {
+    service
+        .recycle_rated_photo(payload.file_instance_id)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -144,6 +155,7 @@ pub fn run() {
             history_list_actions,
             rating_set,
             rating_undo,
+            rating_recycle_photo,
             rating_list_photos
         ])
         .run(tauri::generate_context!())

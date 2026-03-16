@@ -225,12 +225,26 @@ pub struct PhotoRating {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingUndoResult {
+    pub file_instance_id: i64,
+    pub restored_rating: Option<i32>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetRatingPayload {
     pub file_instance_id: i64,
     pub rating: i32,
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecycleRatedPhotoPayload {
+    pub file_instance_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
