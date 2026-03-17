@@ -12,8 +12,20 @@ import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 import {
+  aiCreateSetFromClassify,
+  aiDeleteSet,
+  aiDownloadModel,
+  aiGetOverview,
+  aiGetPreferenceTasks,
+  aiGetRankedItems,
+  aiGetSetDetail,
+  aiListSets,
+  aiRankSet,
+  aiSubmitPreference,
+  aiTrainAndRankSet,
   applyDecision,
   cancelScan,
+  listClassifyPhotos,
   listRatedPhotos,
   loadActions,
   loadGroup,
@@ -28,6 +40,14 @@ import {
   undoRating,
 } from "./api";
 import type {
+  AiOverview,
+  AiPreferenceTask,
+  AiRankedPhoto,
+  AiSetDetail,
+  AiSetSummary,
+  ClassifyPhoto,
+  ClassifyPhotoFilter,
+  ClassifySortOrder,
   GroupDetail,
   GroupMember,
   GroupingProgress,
@@ -45,7 +65,7 @@ import type {
   UnknownFormatSummary,
 } from "./types";
 
-type AppTab = "scan" | "review" | "history" | "rating";
+type AppTab = "scan" | "review" | "rating" | "classify" | "ai" | "history";
 
 const kindTabs: Array<{ label: string; value: MatchKind | null }> = [
   { label: "全部", value: null },
@@ -59,6 +79,8 @@ const statusTabs: Array<{ label: string; value: ReviewStatus | null }> = [
   { label: "已应用", value: "applied" },
   { label: "全部", value: null },
 ];
+
+const AI_RESULTS_PAGE_SIZE = 48;
 
 const loadedPreviewImageSrcs = new Set<string>();
 const pendingPreviewImageLoads = new Map<string, Promise<void>>();
@@ -221,6 +243,40 @@ function App() {
     targets: [],
   });
   const PAGE_SIZE = 500;
+  const CLASSIFY_PAGE_SIZE = 50;
+
+  // ── Classify state ──────────────────────────────────────────────────────────
+  const [classifyPhotos, setClassifyPhotos] = useState<ClassifyPhoto[]>([]);
+  const [classifyTotal, setClassifyTotal] = useState(0);
+  const [classifySelectedId, setClassifySelectedId] = useState<number | null>(null);
+  const [classifyLoading, setClassifyLoading] = useState(false);
+  const [classifyLoadingMore, setClassifyLoadingMore] = useState(false);
+  const [classifyHasMore, setClassifyHasMore] = useState(false);
+  const [classifyFilter, setClassifyFilter] = useState<ClassifyPhotoFilter>({});
+  const [classifySort, setClassifySort] = useState<ClassifySortOrder>("quality_desc");
+  const [classifyPathInput, setClassifyPathInput] = useState("");
+  const classifyPhotosRef = useRef(classifyPhotos);
+  classifyPhotosRef.current = classifyPhotos;
+  const classifyFilterRef = useRef(classifyFilter);
+  classifyFilterRef.current = classifyFilter;
+  const classifySortRef = useRef(classifySort);
+  classifySortRef.current = classifySort;
+
+  // ── AI state ─────────────────────────────────────────────────────────────────
+  const [aiOverview, setAiOverview] = useState<AiOverview | null>(null);
+  const [aiSets, setAiSets] = useState<AiSetSummary[]>([]);
+  const [aiSelectedSetId, setAiSelectedSetId] = useState<number | null>(null);
+  const [aiSelectedSet, setAiSelectedSet] = useState<AiSetDetail | null>(null);
+  const [aiTasks, setAiTasks] = useState<AiPreferenceTask[]>([]);
+  const [aiRankedItems, setAiRankedItems] = useState<AiRankedPhoto[]>([]);
+  const [aiRankedTotal, setAiRankedTotal] = useState(0);
+  const [aiResultBucket, setAiResultBucket] = useState<"top" | "mid" | "back">("top");
+  const [aiResultLoadingMore, setAiResultLoadingMore] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiActionBusy, setAiActionBusy] = useState(false);
+  const prevAiOverviewRef = useRef<AiOverview | null>(null);
+  const aiResultsSectionRef = useRef<HTMLElement | null>(null);
+
   const ratingCurrentPhoto = ratingPhotos[ratingPhotoIdx] ?? null;
   const ratingPrevPhoto = ratingPhotoIdx > 0 ? ratingPhotos[ratingPhotoIdx - 1] : null;
   const ratingNextPhoto = ratingPhotoIdx < ratingPhotos.length - 1
@@ -273,6 +329,49 @@ function App() {
       void preloadPreviewImage(src).catch(() => undefined);
     });
   }, [activeTab, ratingPhotoIdx, ratingPhotos]);
+
+  useEffect(() => {
+    if (activeTab !== "classify") return;
+    void loadClassifyPage(classifyFilter, classifySort, 0, { append: false });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, classifyFilter, classifySort]);
+
+  useEffect(() => {
+    if (activeTab !== "ai") return;
+    let cancelled = false;
+    const refresh = () => {
+      if (cancelled) return;
+      void Promise.all([aiGetOverview(), aiListSets()]).then(([overview, sets]) => {
+        if (cancelled) return;
+        const prev = prevAiOverviewRef.current;
+        if (prev?.runningJob != null && overview.runningJob == null && aiSelectedSetId != null) {
+          void loadAiSetWorkspace(aiSelectedSetId);
+        }
+        prevAiOverviewRef.current = overview;
+        setAiOverview(overview);
+        setAiSets(sets);
+        if (aiSelectedSetId == null && sets.length > 0) {
+          setAiSelectedSetId(sets[0]?.id ?? null);
+        }
+      }).catch(() => undefined);
+    };
+    refresh();
+    const timer = setInterval(refresh, 2000);
+    return () => { cancelled = true; clearInterval(timer); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, aiSelectedSetId]);
+
+  useEffect(() => {
+    if (activeTab !== "ai" || aiSelectedSetId == null) {
+      setAiSelectedSet(null);
+      setAiTasks([]);
+      setAiRankedItems([]);
+      setAiRankedTotal(0);
+      return;
+    }
+    void loadAiSetWorkspace(aiSelectedSetId);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, aiSelectedSetId]);
 
   useEffect(() => {
     if (selectedGroupId == null) {
@@ -506,6 +605,250 @@ function App() {
       } else {
         setRatingLoading(false);
       }
+    }
+  }
+
+  async function loadClassifyPage(
+    filter: ClassifyPhotoFilter,
+    sort: ClassifySortOrder,
+    offset: number,
+    options?: { append?: boolean },
+  ) {
+    const append = options?.append ?? false;
+    if (append) {
+      setClassifyLoadingMore(true);
+    } else {
+      setClassifyLoading(true);
+      setClassifyHasMore(false);
+    }
+    try {
+      const page = await listClassifyPhotos(filter, sort, offset, CLASSIFY_PAGE_SIZE);
+      // Stale check: if filter/sort changed while we were waiting, discard result.
+      if (
+        classifyFilterRef.current !== filter ||
+        classifySortRef.current !== sort
+      ) {
+        return;
+      }
+      const nextPhotos = append
+        ? [
+          ...classifyPhotosRef.current,
+          ...page.photos.filter(
+            (p) => !classifyPhotosRef.current.some((e) => e.fileInstanceId === p.fileInstanceId),
+          ),
+        ]
+        : page.photos;
+      setClassifyPhotos(nextPhotos);
+      setClassifyTotal(page.total);
+      setClassifyHasMore(nextPhotos.length < page.total);
+      if (!append && nextPhotos.length > 0) {
+        setClassifySelectedId((prev) =>
+          nextPhotos.some((p) => p.fileInstanceId === prev) ? prev : (nextPhotos[0]?.fileInstanceId ?? null),
+        );
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      if (append) {
+        setClassifyLoadingMore(false);
+      } else {
+        setClassifyLoading(false);
+      }
+    }
+  }
+
+  function setOptimisticAiJob(
+    jobType: string,
+    message: string,
+  ) {
+    const prev = prevAiOverviewRef.current;
+    if (prev == null) return;
+    const next: AiOverview = {
+      ...prev,
+      runningJob: {
+        id: -1,
+        jobType,
+        status: "pending",
+        payloadJson: null,
+        progressDone: 0,
+        progressTotal: 0,
+        message,
+        createdAt: "",
+        startedAt: null,
+        finishedAt: null,
+      },
+    };
+    prevAiOverviewRef.current = next;
+    setAiOverview(next);
+  }
+
+  async function loadAiSetWorkspace(setId: number) {
+    setAiLoading(true);
+    try {
+      const [detail, tasks] = await Promise.all([
+        aiGetSetDetail(setId),
+        aiGetPreferenceTasks(setId, 20),
+      ]);
+      const initialBucket = detail.topCount > 0
+        ? "top"
+        : detail.midCount > 0
+          ? "mid"
+          : "back";
+      const rankedPage = detail.latestModelRun == null
+        ? { items: [], total: 0 }
+        : await aiGetRankedItems(setId, initialBucket, 0, AI_RESULTS_PAGE_SIZE).catch(() => ({
+          items: [],
+          total: 0,
+        }));
+      if (aiSelectedSetId !== setId && aiSelectedSetId != null) {
+        return;
+      }
+      setAiSelectedSet(detail);
+      setAiTasks(tasks);
+      setAiResultBucket(initialBucket);
+      setAiRankedItems(rankedPage.items);
+      setAiRankedTotal(rankedPage.total);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
+  async function loadAiRankBucket(
+    setId: number,
+    bucket: "top" | "mid" | "back",
+    offset: number,
+    options?: { append?: boolean },
+  ) {
+    const append = options?.append ?? false;
+    if (append) {
+      setAiResultLoadingMore(true);
+    } else {
+      setAiLoading(true);
+    }
+    try {
+      const page = await aiGetRankedItems(setId, bucket, offset, AI_RESULTS_PAGE_SIZE);
+      if (aiSelectedSetId !== setId) return;
+      setAiResultBucket(bucket);
+      setAiRankedTotal(page.total);
+      setAiRankedItems((prev) => {
+        if (!append) return page.items;
+        const existingIds = new Set(prev.map((item) => item.contentAssetId));
+        return [...prev, ...page.items.filter((item) => !existingIds.has(item.contentAssetId))];
+      });
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      if (append) {
+        setAiResultLoadingMore(false);
+      } else {
+        setAiLoading(false);
+      }
+    }
+  }
+
+  function focusAiResultsSection() {
+    window.requestAnimationFrame(() => {
+      aiResultsSectionRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+  }
+
+  function handleAiBucketSelect(bucket: "top" | "mid" | "back") {
+    if (aiSelectedSet == null) return;
+    focusAiResultsSection();
+    void loadAiRankBucket(aiSelectedSet.id, bucket, 0, { append: false });
+  }
+
+  async function handleAiDownload() {
+    try {
+      await aiDownloadModel();
+      setOptimisticAiJob("download_model", "正在启动下载…");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function handleCreateAiSetFromClassify() {
+    setAiActionBusy(true);
+    try {
+      const setDetail = await aiCreateSetFromClassify({
+        filter: classifyFilterRef.current,
+        sort: classifySortRef.current,
+      });
+      const sets = await aiListSets();
+      setAiSets(sets);
+      setAiSelectedSetId(setDetail.id);
+      setActiveTab("ai");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setAiActionBusy(false);
+    }
+  }
+
+  async function handleAiTrainAndRankSet() {
+    if (aiSelectedSetId == null) return;
+    try {
+      await aiTrainAndRankSet(aiSelectedSetId);
+      setOptimisticAiJob("train_and_rank_set", "正在训练并排序当前集合…");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function handleAiRerankSet() {
+    if (aiSelectedSetId == null) return;
+    try {
+      await aiRankSet(aiSelectedSetId);
+      setOptimisticAiJob("rank_set", "正在按当前模型重新排序…");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function handleAiVote(choice: "left" | "right" | "tie" | "skip") {
+    if (aiSelectedSetId == null || aiTasks.length === 0) return;
+    const task = aiTasks[0];
+    setAiActionBusy(true);
+    try {
+      await aiSubmitPreference({
+        setId: aiSelectedSetId,
+        leftContentAssetId: task.left.contentAssetId,
+        rightContentAssetId: task.right.contentAssetId,
+        choice,
+      });
+      const nextTasks = aiTasks.slice(1);
+      setAiTasks(nextTasks);
+      const [detail, fallbackTasks] = await Promise.all([
+        aiGetSetDetail(aiSelectedSetId),
+        nextTasks.length < 5 ? aiGetPreferenceTasks(aiSelectedSetId, 20) : Promise.resolve(nextTasks),
+      ]);
+      setAiSelectedSet(detail);
+      setAiTasks(nextTasks.length < 5 ? fallbackTasks : nextTasks);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setAiActionBusy(false);
+    }
+  }
+
+  async function handleDeleteAiSet(setId: number) {
+    setAiActionBusy(true);
+    try {
+      await aiDeleteSet(setId);
+      const sets = await aiListSets();
+      setAiSets(sets);
+      if (aiSelectedSetId === setId) {
+        setAiSelectedSetId(sets[0]?.id ?? null);
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setAiActionBusy(false);
     }
   }
 
@@ -778,6 +1121,36 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [activeTab, handleRatingKey, ratingImmersive]);
 
+  useEffect(() => {
+    if (activeTab !== "ai") return;
+    function onKeyDown(event: KeyboardEvent) {
+      const tag = (event.target as HTMLElement).tagName.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      if (aiTasks.length === 0 || aiActionBusy) return;
+      if (event.key === "a" || event.key === "A") {
+        event.preventDefault();
+        void handleAiVote("left");
+        return;
+      }
+      if (event.key === "d" || event.key === "D") {
+        event.preventDefault();
+        void handleAiVote("right");
+        return;
+      }
+      if (event.key === "s" || event.key === "S") {
+        event.preventDefault();
+        void handleAiVote("tie");
+        return;
+      }
+      if (event.key === " ") {
+        event.preventDefault();
+        void handleAiVote("skip");
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeTab, aiActionBusy, aiTasks]);
+
   async function waitForScanCompletion(
     onProgress: (progress: ScanProgress) => void,
   ): Promise<ScanResult> {
@@ -813,7 +1186,7 @@ function App() {
         </div>
 
         <nav className="sidebar-nav">
-          {(["scan", "review", "rating", "history"] as AppTab[]).map((tab) => (
+          {(["scan", "review", "rating", "classify", "ai", "history"] as AppTab[]).map((tab) => (
             <button
               key={tab}
               className={`nav-item ${activeTab === tab ? "nav-item--active" : ""}`}
@@ -846,6 +1219,8 @@ function App() {
         {activeTab === "scan" && renderScanTab()}
         {activeTab === "review" && renderReviewTab()}
         {activeTab === "rating" && renderRatingTab()}
+        {activeTab === "classify" && renderClassifyTab()}
+        {activeTab === "ai" && renderAiTab()}
         {activeTab === "history" && renderHistoryTab()}
       </main>
 
@@ -1628,6 +2003,878 @@ function App() {
     );
   }
 
+  // ─── Classify Tab ─────────────────────────────────────────────────────────
+
+  function renderClassifyTab() {
+    const selectedPhoto = classifyPhotos.find(
+      (p) => p.fileInstanceId === classifySelectedId,
+    ) ?? null;
+
+    function updateFilter(patch: Partial<ClassifyPhotoFilter>) {
+      setClassifyFilter((prev) => ({ ...prev, ...patch }));
+      setClassifySelectedId(null);
+    }
+
+    const ratingModeValue = classifyFilter.ratingMode ?? "all";
+    const groupFilterValue = classifyFilter.groupFilter ?? "all";
+    const activeExts = classifyFilter.extensions ?? [];
+
+    function toggleExt(ext: string) {
+      const next = activeExts.includes(ext)
+        ? activeExts.filter((e) => e !== ext)
+        : [...activeExts, ext];
+      updateFilter({ extensions: next.length > 0 ? next : null });
+    }
+
+    function handleListScroll(event: React.UIEvent<HTMLDivElement>) {
+      if (classifyLoading || classifyLoadingMore || !classifyHasMore) return;
+      const el = event.currentTarget;
+      const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (remaining > 320) return;
+      void loadClassifyPage(
+        classifyFilterRef.current,
+        classifySortRef.current,
+        classifyPhotosRef.current.length,
+        { append: true },
+      );
+    }
+
+    const KNOWN_EXTS = ["jpg", "jpeg", "png", "webp", "heic", "heif", "rw2"];
+
+    return (
+      <div className="page classify-page">
+        {/* ── Filter Panel ─────────────────────────────────────────────── */}
+        <aside className="classify-filters">
+          <div className="classify-filters-title">筛选</div>
+
+          {/* Sort */}
+          <div className="classify-filter-section">
+            <div className="classify-filter-label">排序</div>
+            <select
+              className="classify-select"
+              value={classifySort}
+              onChange={(e) => setClassifySort(e.target.value as ClassifySortOrder)}
+            >
+              <option value="quality_desc">质量分 ↓</option>
+              <option value="quality_asc">质量分 ↑</option>
+              <option value="rating_desc">评分 ↓</option>
+              <option value="rating_asc">评分 ↑</option>
+              <option value="resolution_desc">分辨率 ↓</option>
+              <option value="path_asc">路径 A→Z</option>
+              <option value="file_id_asc">导入顺序</option>
+              <option value="updated_desc">最近更新</option>
+            </select>
+          </div>
+
+          {/* Rating */}
+          <div className="classify-filter-section">
+            <div className="classify-filter-label">评分</div>
+            <div className="classify-chip-row">
+              {(["all", "unrated", "rated", "min"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  className={`chip ${ratingModeValue === mode ? "chip--active" : ""}`}
+                  onClick={() => updateFilter({ ratingMode: mode === "all" ? null : mode })}
+                >
+                  {{ all: "全部", unrated: "未评分", rated: "已评分", min: "≥ N" }[mode]}
+                </button>
+              ))}
+            </div>
+            {ratingModeValue === "min" && (
+              <input
+                type="number"
+                className="classify-number-input"
+                min={1}
+                max={5}
+                placeholder="最低评分 1–5"
+                value={classifyFilter.minRating ?? ""}
+                onChange={(e) => {
+                  const val = e.target.value === "" ? null : parseInt(e.target.value, 10);
+                  updateFilter({ minRating: val });
+                }}
+              />
+            )}
+          </div>
+
+          {/* Quality */}
+          <div className="classify-filter-section">
+            <div className="classify-filter-label">技术质量分</div>
+            <div className="classify-row-2col">
+              <input
+                type="number"
+                className="classify-number-input"
+                min={0}
+                max={100}
+                step={5}
+                placeholder="最低"
+                value={classifyFilter.minQuality ?? ""}
+                onChange={(e) => {
+                  const val = e.target.value === "" ? null : parseFloat(e.target.value);
+                  updateFilter({ minQuality: val });
+                }}
+              />
+              <input
+                type="number"
+                className="classify-number-input"
+                min={0}
+                max={100}
+                step={5}
+                placeholder="最高"
+                value={classifyFilter.maxQuality ?? ""}
+                onChange={(e) => {
+                  const val = e.target.value === "" ? null : parseFloat(e.target.value);
+                  updateFilter({ maxQuality: val });
+                }}
+              />
+            </div>
+          </div>
+
+          {/* Resolution */}
+          <div className="classify-filter-section">
+            <div className="classify-filter-label">最低分辨率</div>
+            <div className="classify-row-2col">
+              <input
+                type="number"
+                className="classify-number-input"
+                min={0}
+                step={100}
+                placeholder="最低宽度"
+                value={classifyFilter.minWidth ?? ""}
+                onChange={(e) => {
+                  const val = e.target.value === "" ? null : parseInt(e.target.value, 10);
+                  updateFilter({ minWidth: val });
+                }}
+              />
+              <input
+                type="number"
+                className="classify-number-input"
+                min={0}
+                step={100}
+                placeholder="最低高度"
+                value={classifyFilter.minHeight ?? ""}
+                onChange={(e) => {
+                  const val = e.target.value === "" ? null : parseInt(e.target.value, 10);
+                  updateFilter({ minHeight: val });
+                }}
+              />
+            </div>
+            <input
+              type="number"
+              className="classify-number-input"
+              min={0}
+              step={0.5}
+              placeholder="最低像素量 (MP)"
+              value={classifyFilter.minMegapixels ?? ""}
+              onChange={(e) => {
+                const val = e.target.value === "" ? null : parseFloat(e.target.value);
+                updateFilter({ minMegapixels: val });
+              }}
+            />
+          </div>
+
+          {/* Format */}
+          <div className="classify-filter-section">
+            <div className="classify-filter-label">格式</div>
+            <div className="classify-ext-grid">
+              {KNOWN_EXTS.map((ext) => (
+                <button
+                  key={ext}
+                  className={`chip chip--sm ${activeExts.includes(ext) ? "chip--active" : ""}`}
+                  onClick={() => toggleExt(ext)}
+                >
+                  {ext}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Preview */}
+          <div className="classify-filter-section">
+            <label className="classify-checkbox-row">
+              <input
+                type="checkbox"
+                checked={classifyFilter.previewOnly ?? false}
+                onChange={(e) => updateFilter({ previewOnly: e.target.checked || null })}
+              />
+              仅可预览
+            </label>
+          </div>
+
+          {/* Group */}
+          <div className="classify-filter-section">
+            <div className="classify-filter-label">分组状态</div>
+            {(
+              [
+                ["all", "全部"],
+                ["in_group", "在组中"],
+                ["not_in_group", "不在组中"],
+                ["pending_group", "待审核组"],
+                ["exact", "待处理·完全重复"],
+                ["similar", "待处理·视觉相似"],
+                ["raw_jpeg_set", "待处理·RAW + 导出"],
+              ] as const
+            ).map(([val, label]) => (
+              <button
+                key={val}
+                className={`classify-group-btn ${groupFilterValue === val ? "classify-group-btn--active" : ""}`}
+                onClick={() => updateFilter({ groupFilter: val === "all" ? null : val })}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Path search */}
+          <div className="classify-filter-section">
+            <div className="classify-filter-label">路径搜索</div>
+            <input
+              type="text"
+              className="classify-text-input"
+              placeholder="路径关键词…"
+              value={classifyPathInput}
+              onChange={(e) => {
+                setClassifyPathInput(e.target.value);
+                updateFilter({ pathContains: e.target.value || null });
+              }}
+            />
+          </div>
+
+          {/* Reset */}
+          <button
+            className="btn btn--ghost classify-reset-btn"
+            onClick={() => {
+              setClassifyFilter({});
+              setClassifySort("quality_desc");
+              setClassifyPathInput("");
+            }}
+          >
+            重置筛选
+          </button>
+        </aside>
+
+        {/* ── List Column ─────────────────────────────────────────────── */}
+        <div className="classify-list-wrapper">
+
+        {/* ── Result List ──────────────────────────────────────────────── */}
+        <div className="classify-list-col">
+          <div className="classify-list-header">
+            <div>
+              {classifyLoading ? (
+                <span className="classify-count-text">加载中…</span>
+              ) : (
+                <span className="classify-count-text">
+                  共 <strong>{classifyTotal}</strong> 张
+                  {classifyPhotos.length < classifyTotal
+                    ? `（已加载 ${classifyPhotos.length}）`
+                    : ""}
+                </span>
+              )}
+            </div>
+            <button
+              className="btn btn--sm btn--primary"
+              onClick={() => void handleCreateAiSetFromClassify()}
+              disabled={classifyLoading || classifyTotal === 0 || aiActionBusy}
+            >
+              发送当前结果到 AI
+            </button>
+          </div>
+
+          <div
+            className="classify-list"
+            onScroll={handleListScroll}
+          >
+            {!classifyLoading && classifyPhotos.length === 0 && (
+              <div className="classify-empty">
+                <div className="classify-empty-icon">⊞</div>
+                <div className="classify-empty-title">无匹配结果</div>
+                <div className="classify-empty-sub">尝试调整筛选条件</div>
+              </div>
+            )}
+
+            {classifyPhotos.map((photo) => {
+              const isSelected = photo.fileInstanceId === classifySelectedId;
+              const fileName = photo.path.split(/[\\/]/).pop() ?? photo.path;
+              const rating = photo.userRating;
+              const stars = rating != null
+                ? "★".repeat(rating) + "☆".repeat(5 - rating)
+                : "☆☆☆☆☆";
+
+              return (
+                <button
+                  key={photo.fileInstanceId}
+                  className={`classify-list-item ${isSelected ? "classify-list-item--selected" : ""}`}
+                  onClick={() => setClassifySelectedId(photo.fileInstanceId)}
+                >
+                  <div className="classify-item-thumb">
+                    {photo.thumbnailPath ? (
+                      <img
+                        src={convertFileSrc(photo.thumbnailPath)}
+                        alt=""
+                        className="classify-thumb-img"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div className="classify-thumb-placeholder">
+                        {photo.extension.toUpperCase()}
+                      </div>
+                    )}
+                  </div>
+                  <div className="classify-item-info">
+                    <div className="classify-item-name">{fileName}</div>
+                    <div className="classify-item-meta">
+                      <span className="classify-item-rating">{stars}</span>
+                      {photo.qualityScore != null && (
+                        <span className="classify-item-quality">
+                          Q {photo.qualityScore.toFixed(0)}
+                        </span>
+                      )}
+                    </div>
+                    {photo.width && photo.height && (
+                      <div className="classify-item-res">
+                        {photo.width}×{photo.height}
+                      </div>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+
+            {classifyLoadingMore && (
+              <div className="classify-loading-more">加载更多…</div>
+            )}
+          </div>
+        </div>
+        </div>{/* end classify-list-wrapper */}
+
+        {/* ── Detail / Preview Panel ───────────────────────────────────── */}
+        <div className="classify-detail-col">
+          {selectedPhoto == null ? (
+            <div className="classify-detail-empty">选择一张照片查看详情</div>
+          ) : (
+            <div className="classify-detail">
+              {/* Preview */}
+              <div className="classify-preview-area">
+                {selectedPhoto.previewSupported ? (
+                  <BufferedPreviewImage
+                    src={convertFileSrc(selectedPhoto.path)}
+                    className="classify-preview-img"
+                    alt=""
+                  />
+                ) : selectedPhoto.thumbnailPath ? (
+                  <img
+                    src={convertFileSrc(selectedPhoto.thumbnailPath)}
+                    className="classify-preview-img classify-preview-img--thumb"
+                    alt=""
+                  />
+                ) : (
+                  <div className="classify-preview-no-image">
+                    <div>{selectedPhoto.extension.toUpperCase()}</div>
+                    <div>不支持预览</div>
+                  </div>
+                )}
+              </div>
+
+              {/* Metadata */}
+              <div className="classify-detail-meta">
+                <div className="classify-detail-filename">
+                  {selectedPhoto.path.split(/[\\/]/).pop() ?? selectedPhoto.path}
+                </div>
+                <div className="classify-detail-path">{selectedPhoto.path}</div>
+
+                <div className="classify-meta-grid">
+                  <span className="classify-meta-key">格式</span>
+                  <span className="classify-meta-val">
+                    {selectedPhoto.formatName ?? selectedPhoto.extension.toUpperCase()}
+                  </span>
+
+                  {selectedPhoto.width && selectedPhoto.height && (
+                    <>
+                      <span className="classify-meta-key">尺寸</span>
+                      <span className="classify-meta-val">
+                        {selectedPhoto.width} × {selectedPhoto.height}
+                        {" "}
+                        <span className="classify-meta-dim">
+                          ({((selectedPhoto.width * selectedPhoto.height) / 1_000_000).toFixed(1)} MP)
+                        </span>
+                      </span>
+                    </>
+                  )}
+
+                  <span className="classify-meta-key">评分</span>
+                  <span className="classify-meta-val">
+                    {selectedPhoto.userRating != null
+                      ? `${"★".repeat(selectedPhoto.userRating)}${"☆".repeat(5 - selectedPhoto.userRating)} (${selectedPhoto.userRating})`
+                      : "未评分"}
+                  </span>
+
+                  <span className="classify-meta-key">质量分</span>
+                  <span className="classify-meta-val">
+                    {selectedPhoto.qualityScore != null
+                      ? selectedPhoto.qualityScore.toFixed(1)
+                      : "—"}
+                  </span>
+
+                  <span className="classify-meta-key">预览</span>
+                  <span className="classify-meta-val">
+                    {selectedPhoto.previewSupported ? "✓ 支持" : "✗ 不支持"}
+                  </span>
+
+                  {selectedPhoto.groupId != null && (
+                    <>
+                      <span className="classify-meta-key">所属分组</span>
+                      <span className="classify-meta-val">
+                        {selectedPhoto.groupKind != null
+                          ? kindLabel(selectedPhoto.groupKind)
+                          : "—"}
+                        {" · "}
+                        {selectedPhoto.groupStatus != null
+                          ? statusLabel(selectedPhoto.groupStatus)
+                          : ""}
+                        {" "}
+                        <span className="classify-meta-dim">#{selectedPhoto.groupId}</span>
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                {/* Jump actions */}
+                <div className="classify-detail-actions">
+                  {selectedPhoto.groupId != null && (
+                    <button
+                      className="btn btn--ghost"
+                      onClick={() => {
+                        setSelectedGroupId(selectedPhoto.groupId!);
+                        setActiveTab("review");
+                      }}
+                    >
+                      跳转到审核组
+                    </button>
+                  )}
+                  {selectedPhoto.userRating == null && (
+                    <button
+                      className="btn btn--ghost"
+                      onClick={() => setActiveTab("rating")}
+                    >
+                      去评分页打分
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  function renderAiTab() {
+    const currentTask = aiTasks[0] ?? null;
+    const rankedGroups: Array<{
+      key: "top" | "mid" | "back";
+      label: string;
+      description: string;
+      count: number;
+    }> = [
+      { key: "top", label: "优先看", description: "当前集合内更值得先看的一批", count: aiSelectedSet?.topCount ?? 0 },
+      { key: "mid", label: "中间", description: "结果稳定，但优先级没有明显拉开", count: aiSelectedSet?.midCount ?? 0 },
+      { key: "back", label: "相对靠后", description: "当前集合内相对靠后，不代表废片", count: aiSelectedSet?.backCount ?? 0 },
+    ];
+    const activeRankGroup = rankedGroups.find((group) => group.key === aiResultBucket) ?? rankedGroups[0];
+
+    return (
+      <div className="page ai-page">
+        <div className="page-header">
+          <div>
+            <h1 className="page-title">AI</h1>
+            <p className="page-subtitle">集合内相对排序，不是绝对审美真值</p>
+          </div>
+          <div className="ai-page-actions">
+            {aiOverview?.modelFile.available ? (
+              <button
+                className="btn btn--primary"
+                onClick={() => void handleCreateAiSetFromClassify()}
+                disabled={classifyTotal === 0 || aiActionBusy}
+              >
+                从当前分类结果创建集合
+              </button>
+            ) : (
+              <button
+                className="btn btn--primary"
+                onClick={() => void handleAiDownload()}
+                disabled={aiOverview?.runningJob != null}
+              >
+                下载 CLIP 模型
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="ai-overview-strip">
+          <div className="ai-overview-card">
+            <div className="ai-overview-label">模型状态</div>
+            <div className="ai-overview-value">
+              {aiOverview?.modelStatus === "ready"
+                ? "已训练，可用于排序"
+                : aiOverview?.modelStatus === "untrained"
+                  ? "未训练"
+                  : "训练数据不足"}
+            </div>
+            <div className="ai-overview-sub">
+              {aiOverview?.activeModelRun
+                ? `${aiOverview.activeModelRun.headType} · ${aiOverview.activeModelRun.trainingPairCount} 对样本`
+                : "偏好比较为主，星级只作弱辅助"}
+            </div>
+          </div>
+          <div className="ai-overview-card">
+            <div className="ai-overview-label">偏好反馈</div>
+            <div className="ai-overview-value">{aiOverview?.preferenceVoteCount ?? 0}</div>
+            <div className="ai-overview-sub">跨集合累积，可共同训练全局偏好模型</div>
+          </div>
+          <div className="ai-overview-card">
+            <div className="ai-overview-label">集合数</div>
+            <div className="ai-overview-value">{aiOverview?.setCount ?? 0}</div>
+            <div className="ai-overview-sub">
+              {aiOverview?.modelFile.available
+                ? "结果只在各自集合内有效"
+                : "需要先准备本地 CLIP 模型"}
+            </div>
+          </div>
+        </div>
+
+        <div className="ai-workflow-strip">
+          <div className="ai-workflow-step">
+            <div className="ai-workflow-index">1</div>
+            <div>
+              <div className="ai-workflow-title">创建集合</div>
+              <div className="ai-workflow-text">从分类页把当前筛选结果发到 AI，形成静态快照。</div>
+            </div>
+          </div>
+          <div className="ai-workflow-step">
+            <div className="ai-workflow-index">2</div>
+            <div>
+              <div className="ai-workflow-title">做偏好比较</div>
+              <div className="ai-workflow-text">告诉 AI 左右哪张更符合你的口味，星级只作弱辅助。</div>
+            </div>
+          </div>
+          <div className="ai-workflow-step">
+            <div className="ai-workflow-index">3</div>
+            <div>
+              <div className="ai-workflow-title">训练并排序</div>
+              <div className="ai-workflow-text">训练全局偏好模型，再对当前集合生成相对排序。</div>
+            </div>
+          </div>
+          <div className="ai-workflow-step">
+            <div className="ai-workflow-index">4</div>
+            <div>
+              <div className="ai-workflow-title">看结果并纠偏</div>
+              <div className="ai-workflow-text">查看优先看/中间/相对靠后，不满意就继续比较纠偏。</div>
+            </div>
+          </div>
+        </div>
+
+        {aiOverview?.runningJob != null && (
+          <div className="ai-running-banner">
+            <div className="ai-running-title">正在执行：{aiOverview.runningJob.jobType}</div>
+            <div className="ai-progress-bar-wrap">
+              {aiOverview.runningJob.progressTotal > 0 ? (
+                <div
+                  className="ai-progress-bar"
+                  style={{
+                    width: `${Math.max(
+                      4,
+                      Math.round((aiOverview.runningJob.progressDone / aiOverview.runningJob.progressTotal) * 100),
+                    )}%`,
+                  }}
+                />
+              ) : (
+                <div className="ai-progress-bar ai-progress-bar--indeterminate" />
+              )}
+            </div>
+            <div className="ai-running-msg">{aiOverview.runningJob.message ?? "处理中…"}</div>
+          </div>
+        )}
+
+        {aiOverview?.runningJob == null && aiOverview?.latestJob?.status === "failed" && aiOverview.latestJob.jobType !== "download_model" && (
+          <div className="ai-warning-box ai-warning-box--error">
+            <strong>最近一次 AI 任务失败：{aiOverview.latestJob.jobType}</strong>
+            <span>{aiOverview.latestJob.message ?? "未返回详细错误"}</span>
+          </div>
+        )}
+
+        {aiOverview != null && !aiOverview.modelFile.available && (
+          <div className="ai-warning-box">
+            <strong>当前还没有可用的 CLIP 模型。</strong>
+            <span>下载完成后，AI 才能提取图片 embedding 并开始偏好排序。</span>
+            <span className="ai-warning-path">{aiOverview.modelFile.path}</span>
+          </div>
+        )}
+
+        <div className="ai-layout">
+          <aside className="ai-sidebar">
+            <div className="ai-sidebar-head">
+              <div className="ai-sidebar-title">集合</div>
+              <div className="ai-sidebar-sub">从分类页快照当前结果</div>
+            </div>
+            <div className="ai-set-list">
+              {aiSets.length === 0 ? (
+                <div className="ai-empty-card">
+                  <div className="ai-empty-title">还没有 AI 集合</div>
+                  <div className="ai-empty-body">去分类页筛出一批照片，再发送到 AI。</div>
+                </div>
+              ) : (
+                aiSets.map((setItem) => (
+                  <button
+                    key={setItem.id}
+                    className={`ai-set-card ${setItem.id === aiSelectedSetId ? "ai-set-card--active" : ""}`}
+                    onClick={() => setAiSelectedSetId(setItem.id)}
+                  >
+                    <div className="ai-set-card-top">
+                      <span className="ai-set-name">{setItem.name}</span>
+                      <span className="ai-set-count">{setItem.itemCount} 张</span>
+                    </div>
+                    <div className="ai-set-meta">
+                      <span>{setItem.preferenceVoteCount} 次偏好</span>
+                      <span>{setItem.hasRanking ? "已排序" : "未排序"}</span>
+                    </div>
+                    {setItem.lastRankedAt && (
+                      <div className="ai-set-time">最近排序：{formatDate(setItem.lastRankedAt)}</div>
+                    )}
+                  </button>
+                ))
+              )}
+            </div>
+          </aside>
+
+          <div className="ai-main">
+            {aiSelectedSet == null ? (
+              <div className="empty-state">
+                <div className="empty-state-icon"><PhotoIcon /></div>
+                <p className="empty-state-title">选择一个集合开始</p>
+                <p className="empty-state-body">这里会显示偏好比较和排序结果。</p>
+              </div>
+            ) : (
+              <>
+                <section className="ai-section">
+                  <div className="ai-section-head">
+                    <div>
+                      <h2 className="ai-section-title">{aiSelectedSet.name}</h2>
+                      <p className="ai-section-sub">
+                        {aiSelectedSet.itemCount} 张照片，{aiSelectedSet.preferenceVoteCount} 次偏好反馈。
+                        同一张图在不同集合里位置可能不同，这是正常的。
+                      </p>
+                    </div>
+                    <div className="ai-section-actions">
+                      <button
+                        className="btn btn--primary"
+                        onClick={() => void handleAiTrainAndRankSet()}
+                        disabled={aiOverview?.runningJob != null || !aiOverview?.modelFile.available}
+                      >
+                        训练 AI 并排序当前集合
+                      </button>
+                      <button
+                        className="btn btn--ghost"
+                        onClick={() => void handleAiRerankSet()}
+                        disabled={aiOverview?.runningJob != null || aiSelectedSet.latestModelRun == null}
+                      >
+                        用当前模型重新排序
+                      </button>
+                      <button
+                        className="btn btn--ghost"
+                        onClick={() => void handleDeleteAiSet(aiSelectedSet.id)}
+                        disabled={aiActionBusy}
+                      >
+                        删除集合
+                      </button>
+                    </div>
+                  </div>
+                  <div className="ai-section-stats">
+                    <button
+                      className={`ai-pill ai-pill--interactive ${aiResultBucket === "top" ? "ai-pill--active" : ""}`}
+                      onClick={() => handleAiBucketSelect("top")}
+                      disabled={aiSelectedSet.topCount === 0}
+                    >
+                      优先看 {aiSelectedSet.topCount}
+                    </button>
+                    <button
+                      className={`ai-pill ai-pill--interactive ${aiResultBucket === "mid" ? "ai-pill--active" : ""}`}
+                      onClick={() => handleAiBucketSelect("mid")}
+                      disabled={aiSelectedSet.midCount === 0}
+                    >
+                      中间 {aiSelectedSet.midCount}
+                    </button>
+                    <button
+                      className={`ai-pill ai-pill--interactive ${aiResultBucket === "back" ? "ai-pill--active" : ""}`}
+                      onClick={() => handleAiBucketSelect("back")}
+                      disabled={aiSelectedSet.backCount === 0}
+                    >
+                      相对靠后 {aiSelectedSet.backCount}
+                    </button>
+                    <div className="ai-pill">高不确定 {aiSelectedSet.uncertainCount}</div>
+                    {aiSelectedSet.lastRankedAt && (
+                      <div className="ai-pill">最近排序 {formatDate(aiSelectedSet.lastRankedAt)}</div>
+                    )}
+                  </div>
+                  <div className="ai-section-sub ai-section-sub--compact">
+                    点击上面的“优先看 / 中间 / 相对靠后”可以切换结果列表。
+                  </div>
+                  {aiSelectedSet.latestModelRun && (
+                    <div className="ai-model-summary">
+                      <div className="ai-model-summary-title">当前模型</div>
+                      <div className="ai-model-summary-body">
+                        {aiSelectedSet.latestModelRun.headType} ·
+                        显式偏好 {aiSelectedSet.latestModelRun.preferenceVoteCount} ·
+                        星级弱对 {aiSelectedSet.latestModelRun.starPairCount} ·
+                        总训练对 {aiSelectedSet.latestModelRun.trainingPairCount} ·
+                        训练时间 {formatDate(aiSelectedSet.latestModelRun.createdAt)}
+                      </div>
+                    </div>
+                  )}
+                </section>
+
+                <section className="ai-section">
+                  <div className="ai-section-head">
+                    <div>
+                      <h2 className="ai-section-title">偏好比较</h2>
+                      <p className="ai-section-sub">快捷键：A 左优，D 右优，S 差不多，Space 跳过。</p>
+                    </div>
+                  </div>
+                  {currentTask == null ? (
+                    <div className="ai-empty-card">
+                      <div className="ai-empty-title">当前没有新的比较任务</div>
+                      <div className="ai-empty-body">做完这一轮后可以先训练排序，再回来继续纠偏。</div>
+                    </div>
+                  ) : (
+                    <div className="ai-compare-grid">
+                      {[currentTask.left, currentTask.right].map((photo, index) => (
+                        <div key={photo.contentAssetId} className="ai-compare-card">
+                          <div className="ai-compare-label">{index === 0 ? "左边" : "右边"}</div>
+                          <div className="ai-compare-preview">
+                            {photo.previewSupported ? (
+                              <BufferedPreviewImage
+                                src={convertFileSrc(photo.path)}
+                                alt={photo.path}
+                                className="ai-compare-image"
+                              />
+                            ) : photo.thumbnailPath ? (
+                              <img
+                                src={convertFileSrc(photo.thumbnailPath)}
+                                alt={photo.path}
+                                className="ai-compare-image"
+                              />
+                            ) : (
+                              <div className="ai-compare-fallback">{photo.extension.toUpperCase()}</div>
+                            )}
+                          </div>
+                          <div className="ai-compare-meta">
+                            <div className="ai-compare-name">{photo.path.split(/[\\/]/).pop() ?? photo.path}</div>
+                            <div className="ai-compare-sub">
+                              {photo.userRating != null ? `${"★".repeat(photo.userRating)}${"☆".repeat(5 - photo.userRating)}` : "未评分"}
+                              {photo.qualityScore != null ? ` · 质量 ${photo.qualityScore.toFixed(1)}` : ""}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="ai-choice-row">
+                    <button className="btn btn--primary" onClick={() => void handleAiVote("left")} disabled={currentTask == null || aiActionBusy}>左边更好</button>
+                    <button className="btn btn--primary" onClick={() => void handleAiVote("right")} disabled={currentTask == null || aiActionBusy}>右边更好</button>
+                    <button className="btn btn--ghost" onClick={() => void handleAiVote("tie")} disabled={currentTask == null || aiActionBusy}>差不多</button>
+                    <button className="btn btn--ghost" onClick={() => void handleAiVote("skip")} disabled={currentTask == null || aiActionBusy}>跳过</button>
+                  </div>
+                </section>
+
+                <section className="ai-section" ref={aiResultsSectionRef}>
+                  <div className="ai-section-head">
+                    <div>
+                      <h2 className="ai-section-title">排序结果</h2>
+                      <p className="ai-section-sub">
+                        当前桶共 {aiRankedTotal} 张，按排名顺序展示。卡片上的“不确定性”表示模型对该位置的把握程度。
+                      </p>
+                    </div>
+                  </div>
+                  <div className="ai-rank-toolbar">
+                    {rankedGroups.map((group) => (
+                      <button
+                        key={group.key}
+                        className={`ai-rank-tab ${aiResultBucket === group.key ? "ai-rank-tab--active" : ""}`}
+                        onClick={() => handleAiBucketSelect(group.key)}
+                        disabled={aiSelectedSet == null || group.count === 0}
+                      >
+                        {group.label} {group.count}
+                      </button>
+                    ))}
+                    <div className="ai-rank-toolbar-note">
+                      高不确定 {aiSelectedSet.uncertainCount}
+                    </div>
+                  </div>
+                  {aiLoading && aiRankedItems.length === 0 ? (
+                    <div className="ai-empty-card">
+                      <div className="ai-empty-title">正在加载排序结果…</div>
+                    </div>
+                  ) : aiRankedItems.length === 0 ? (
+                    <div className="ai-empty-card">
+                      <div className="ai-empty-title">还没有排序结果</div>
+                      <div className="ai-empty-body">先做少量偏好比较，然后训练并排序当前集合。</div>
+                    </div>
+                  ) : (
+                    <div className="ai-rank-group">
+                      <div className="ai-rank-group-head">
+                        <h3>{activeRankGroup.label}</h3>
+                        <span>{activeRankGroup.description}</span>
+                      </div>
+                      <div className="ai-rank-grid">
+                        {aiRankedItems.map((photo) => (
+                          <div key={photo.contentAssetId} className="ai-rank-card">
+                            <div className="ai-rank-thumb">
+                              {photo.thumbnailPath ? (
+                                <img src={convertFileSrc(photo.thumbnailPath)} alt="" loading="lazy" />
+                              ) : (
+                                <div className="ai-rank-fallback">{photo.extension.toUpperCase()}</div>
+                              )}
+                              <div className="ai-rank-badge">#{photo.rankPosition}</div>
+                            </div>
+                            <div className="ai-rank-body">
+                              <div className="ai-rank-name">{photo.path.split(/[\\/]/).pop() ?? photo.path}</div>
+                              <div className="ai-rank-meta">
+                                第 {photo.rankPosition} / {aiSelectedSet.itemCount} · 前 {photo.percentile.toFixed(0)}%
+                              </div>
+                              <div className="ai-rank-meta">
+                                不确定性 {photo.uncertaintyBucket === "high" ? "高" : photo.uncertaintyBucket === "medium" ? "中" : "低"}
+                                {photo.qualityScore != null ? ` · 质量 ${photo.qualityScore.toFixed(1)}` : ""}
+                                {photo.userRating != null ? ` · ${"★".repeat(photo.userRating)}${"☆".repeat(5 - photo.userRating)}` : ""}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      {aiRankedItems.length < aiRankedTotal && (
+                        <div className="ai-rank-loadmore">
+                          <button
+                            className="btn btn--ghost"
+                            onClick={() => {
+                              if (aiSelectedSet == null) return;
+                              void loadAiRankBucket(aiSelectedSet.id, aiResultBucket, aiRankedItems.length, {
+                                append: true,
+                              });
+                            }}
+                            disabled={aiResultLoadingMore}
+                          >
+                            {aiResultLoadingMore ? "加载中…" : `继续加载更多（已显示 ${aiRankedItems.length} / ${aiRankedTotal}）`}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </section>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderHistoryTab() {
     return (
       <div className="page history-page">
@@ -1896,6 +3143,8 @@ function tabLabel(tab: AppTab): string {
     case "scan": return "扫描";
     case "review": return "审核";
     case "rating": return "评分";
+    case "classify": return "分类";
+    case "ai": return "AI";
     case "history": return "历史";
   }
 }
@@ -1905,6 +3154,8 @@ function tabIcon(tab: AppTab): string {
     case "scan": return "⊕";
     case "rating": return "★";
     case "review": return "◈";
+    case "classify": return "⊞";
+    case "ai": return "◎";
     case "history": return "◷";
   }
 }

@@ -327,6 +327,108 @@ impl ReviewStatus {
     }
 }
 
+/// A single file instance returned by the classify page query.
+/// Contains group membership info so the UI can offer jump links.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifyPhoto {
+    pub file_instance_id: i64,
+    pub content_asset_id: i64,
+    pub path: String,
+    pub extension: String,
+    pub format_name: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub quality_score: Option<f32>,
+    pub preview_supported: bool,
+    pub thumbnail_path: Option<String>,
+    pub user_rating: Option<i32>,
+    /// First group this file belongs to (if any).
+    pub group_id: Option<i64>,
+    pub group_kind: Option<MatchKind>,
+    pub group_status: Option<ReviewStatus>,
+    // AI prediction fields (null when no prediction exists)
+    pub ai_score: Option<f32>,
+    pub ai_confidence: Option<f32>,
+    pub ai_bucket: Option<String>,
+    pub delete_candidate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifyPhotoPage {
+    pub photos: Vec<ClassifyPhoto>,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifyPhotoFilter {
+    /// "all" | "unrated" | "rated" | "min"
+    pub rating_mode: Option<String>,
+    /// Used when rating_mode = "min"
+    pub min_rating: Option<i32>,
+    pub min_quality: Option<f32>,
+    pub max_quality: Option<f32>,
+    pub min_width: Option<u32>,
+    pub min_height: Option<u32>,
+    /// Minimum megapixel count (width × height ÷ 1_000_000)
+    pub min_megapixels: Option<f32>,
+    /// Filter to specific extensions, e.g. ["jpg","png"]. None/empty = no filter.
+    pub extensions: Option<Vec<String>>,
+    pub preview_only: Option<bool>,
+    /// "all" | "in_group" | "not_in_group" | "pending_group" | "exact" | "similar" | "raw_jpeg_set"
+    pub group_filter: Option<String>,
+    pub path_contains: Option<String>,
+    // AI filters
+    pub min_ai_score: Option<f32>,
+    pub max_ai_score: Option<f32>,
+    /// "low" | "maybe" | "high"
+    pub ai_bucket: Option<String>,
+    pub delete_candidate_only: Option<bool>,
+    pub has_ai_prediction: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifySortOrder {
+    QualityDesc,
+    QualityAsc,
+    RatingDesc,
+    RatingAsc,
+    ResolutionDesc,
+    PathAsc,
+    FileIdAsc,
+    UpdatedDesc,
+    AiScoreDesc,
+    AiScoreAsc,
+}
+
+impl ClassifySortOrder {
+    pub fn to_sql(self) -> &'static str {
+        match self {
+            Self::QualityDesc => "ca.quality_score DESC NULLS LAST, fi.id ASC",
+            Self::QualityAsc => "ca.quality_score ASC NULLS LAST, fi.id ASC",
+            Self::RatingDesc => "pr.rating DESC NULLS LAST, fi.id ASC",
+            Self::RatingAsc => "pr.rating ASC NULLS LAST, fi.id ASC",
+            Self::ResolutionDesc => {
+                "(CAST(ca.width AS INTEGER) * CAST(ca.height AS INTEGER)) DESC NULLS LAST, fi.id ASC"
+            }
+            Self::PathAsc => "fi.current_path ASC",
+            Self::FileIdAsc => "fi.id ASC",
+            Self::UpdatedDesc => "fi.last_seen_at DESC, fi.id ASC",
+            Self::AiScoreDesc => "ap.ai_score DESC NULLS LAST, fi.id ASC",
+            Self::AiScoreAsc => "ap.ai_score ASC NULLS LAST, fi.id ASC",
+        }
+    }
+}
+
+impl Default for ClassifySortOrder {
+    fn default() -> Self {
+        Self::QualityDesc
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewGroupFilter {
@@ -340,4 +442,197 @@ pub struct DecisionPayload {
     pub keep_ids: Vec<i64>,
     pub recycle_ids: Vec<i64>,
     pub note: Option<String>,
+}
+
+// ── AI types ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiJob {
+    pub id: i64,
+    pub job_type: String,
+    pub status: String,
+    pub payload_json: Option<String>,
+    pub progress_done: i64,
+    pub progress_total: i64,
+    pub message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiJobStarted {
+    pub job_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelInfo {
+    pub id: i64,
+    pub name: String,
+    pub encoder_name: String,
+    pub encoder_version: String,
+    pub head_type: String,
+    pub training_sample_count: i64,
+    pub metrics_json: Option<String>,
+    pub is_active: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelFile {
+    pub available: bool,
+    pub path: String,
+    pub size_bytes: Option<u64>,
+    pub encoder_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiStatus {
+    pub rated_count: i64,
+    pub embedding_count: i64,
+    pub predicted_count: i64,
+    pub total_assets: i64,
+    pub active_model: Option<AiModelInfo>,
+    pub running_job: Option<AiJob>,
+    pub model_file: AiModelFile,
+    pub active_encoder: String,
+    /// Most recent download_model job (any status), so the UI can show failure reason.
+    pub last_download_job: Option<AiJob>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiCreateSetPayload {
+    pub name: Option<String>,
+    pub filter: ClassifyPhotoFilter,
+    pub sort: ClassifySortOrder,
+    pub selection: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelRunInfo {
+    pub id: i64,
+    pub name: String,
+    pub encoder_name: String,
+    pub encoder_version: String,
+    pub head_type: String,
+    pub preference_vote_count: i64,
+    pub star_pair_count: i64,
+    pub training_pair_count: i64,
+    pub metrics_json: Option<String>,
+    pub is_active: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiOverview {
+    pub model_file: AiModelFile,
+    pub running_job: Option<AiJob>,
+    pub latest_job: Option<AiJob>,
+    pub last_download_job: Option<AiJob>,
+    pub active_model_run: Option<AiModelRunInfo>,
+    pub set_count: i64,
+    pub preference_vote_count: i64,
+    pub rated_count: i64,
+    /// "insufficient_data" | "untrained" | "ready"
+    pub model_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSetSummary {
+    pub id: i64,
+    pub name: String,
+    pub item_count: i64,
+    pub preference_vote_count: i64,
+    pub has_ranking: bool,
+    pub last_ranked_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSetDetail {
+    pub id: i64,
+    pub name: String,
+    pub item_count: i64,
+    pub preference_vote_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_ranked_at: Option<String>,
+    pub latest_model_run: Option<AiModelRunInfo>,
+    pub top_count: i64,
+    pub mid_count: i64,
+    pub back_count: i64,
+    pub uncertain_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSetPhoto {
+    pub file_instance_id: i64,
+    pub content_asset_id: i64,
+    pub path: String,
+    pub extension: String,
+    pub format_name: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub quality_score: Option<f32>,
+    pub preview_supported: bool,
+    pub thumbnail_path: Option<String>,
+    pub user_rating: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiPreferenceTask {
+    pub pair_key: String,
+    pub source: String,
+    pub left: AiSetPhoto,
+    pub right: AiSetPhoto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiPreferenceVotePayload {
+    pub set_id: i64,
+    pub left_content_asset_id: i64,
+    pub right_content_asset_id: i64,
+    /// "left" | "right" | "tie" | "skip"
+    pub choice: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRankedPhoto {
+    pub file_instance_id: i64,
+    pub content_asset_id: i64,
+    pub path: String,
+    pub extension: String,
+    pub format_name: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub quality_score: Option<f32>,
+    pub preview_supported: bool,
+    pub thumbnail_path: Option<String>,
+    pub user_rating: Option<i32>,
+    pub rank_position: i64,
+    pub percentile: f32,
+    pub rank_bucket: String,
+    pub uncertainty_bucket: String,
+    pub score_gap: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRankedPhotoPage {
+    pub items: Vec<AiRankedPhoto>,
+    pub total: i64,
 }

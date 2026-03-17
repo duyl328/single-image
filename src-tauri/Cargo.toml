@@ -25,7 +25,10 @@ blake3 = "1.8.2"
 chrono = { version = "0.4.42", features = ["serde"] }
 hex = "0.4.3"
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
+ndarray = "0.16"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-rustls", "std", "ndarray", "copy-dylibs", "api-24"] }
 rayon = "1.11.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

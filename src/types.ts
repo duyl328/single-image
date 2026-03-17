@@ -195,3 +195,225 @@ export interface PathHistoryItem {
   changeType: string;
   detectedAt: string;
 }
+
+export type ClassifySortOrder =
+  | "quality_desc"
+  | "quality_asc"
+  | "rating_desc"
+  | "rating_asc"
+  | "resolution_desc"
+  | "path_asc"
+  | "file_id_asc"
+  | "updated_desc"
+  | "ai_score_desc"
+  | "ai_score_asc";
+
+export interface ClassifyPhotoFilter {
+  /** "all" | "unrated" | "rated" | "min" */
+  ratingMode?: string | null;
+  minRating?: number | null;
+  minQuality?: number | null;
+  maxQuality?: number | null;
+  minWidth?: number | null;
+  minHeight?: number | null;
+  minMegapixels?: number | null;
+  extensions?: string[] | null;
+  previewOnly?: boolean | null;
+  /** "all" | "in_group" | "not_in_group" | "pending_group" | "exact" | "similar" | "raw_jpeg_set" */
+  groupFilter?: string | null;
+  pathContains?: string | null;
+  // AI filters
+  minAiScore?: number | null;
+  maxAiScore?: number | null;
+  /** "low" | "maybe" | "high" */
+  aiBucket?: string | null;
+  deleteCandidateOnly?: boolean | null;
+  hasAiPrediction?: boolean | null;
+}
+
+export interface ClassifyPhoto {
+  fileInstanceId: number;
+  contentAssetId: number;
+  path: string;
+  extension: string;
+  formatName: string | null;
+  width: number | null;
+  height: number | null;
+  qualityScore: number | null;
+  previewSupported: boolean;
+  thumbnailPath: string | null;
+  userRating: number | null;
+  groupId: number | null;
+  groupKind: MatchKind | null;
+  groupStatus: ReviewStatus | null;
+  // AI prediction fields
+  aiScore: number | null;
+  aiConfidence: number | null;
+  aiBucket: "low" | "maybe" | "high" | null;
+  deleteCandidate: boolean;
+}
+
+// ── AI types ──────────────────────────────────────────────────────────────────
+
+export interface AiJob {
+  id: number;
+  jobType: string;
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  payloadJson: string | null;
+  progressDone: number;
+  progressTotal: number;
+  message: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface AiJobStarted {
+  jobId: number;
+}
+
+export interface AiModelInfo {
+  id: number;
+  name: string;
+  encoderName: string;
+  encoderVersion: string;
+  headType: string;
+  trainingSampleCount: number;
+  metricsJson: string | null;
+  isActive: boolean;
+  createdAt: string;
+}
+
+export interface AiModelFile {
+  available: boolean;
+  path: string;
+  sizeBytes: number | null;
+  encoderName: string;
+}
+
+export interface AiStatus {
+  ratedCount: number;
+  embeddingCount: number;
+  predictedCount: number;
+  totalAssets: number;
+  activeModel: AiModelInfo | null;
+  runningJob: AiJob | null;
+  modelFile: AiModelFile;
+  activeEncoder: string;
+  lastDownloadJob: AiJob | null;
+}
+
+export interface AiCreateSetPayload {
+  name?: string | null;
+  filter: ClassifyPhotoFilter;
+  sort: ClassifySortOrder;
+  selection?: number[] | null;
+}
+
+export interface AiModelRunInfo {
+  id: number;
+  name: string;
+  encoderName: string;
+  encoderVersion: string;
+  headType: string;
+  preferenceVoteCount: number;
+  starPairCount: number;
+  trainingPairCount: number;
+  metricsJson: string | null;
+  isActive: boolean;
+  createdAt: string;
+}
+
+export interface AiOverview {
+  modelFile: AiModelFile;
+  runningJob: AiJob | null;
+  latestJob: AiJob | null;
+  lastDownloadJob: AiJob | null;
+  activeModelRun: AiModelRunInfo | null;
+  setCount: number;
+  preferenceVoteCount: number;
+  ratedCount: number;
+  modelStatus: "insufficient_data" | "untrained" | "ready";
+}
+
+export interface AiSetSummary {
+  id: number;
+  name: string;
+  itemCount: number;
+  preferenceVoteCount: number;
+  hasRanking: boolean;
+  lastRankedAt: string | null;
+  createdAt: string;
+}
+
+export interface AiSetDetail {
+  id: number;
+  name: string;
+  itemCount: number;
+  preferenceVoteCount: number;
+  createdAt: string;
+  updatedAt: string;
+  lastRankedAt: string | null;
+  latestModelRun: AiModelRunInfo | null;
+  topCount: number;
+  midCount: number;
+  backCount: number;
+  uncertainCount: number;
+}
+
+export interface AiSetPhoto {
+  fileInstanceId: number;
+  contentAssetId: number;
+  path: string;
+  extension: string;
+  formatName: string | null;
+  width: number | null;
+  height: number | null;
+  qualityScore: number | null;
+  previewSupported: boolean;
+  thumbnailPath: string | null;
+  userRating: number | null;
+}
+
+export interface AiPreferenceTask {
+  pairKey: string;
+  source: string;
+  left: AiSetPhoto;
+  right: AiSetPhoto;
+}
+
+export interface AiPreferenceVotePayload {
+  setId: number;
+  leftContentAssetId: number;
+  rightContentAssetId: number;
+  choice: "left" | "right" | "tie" | "skip";
+}
+
+export interface AiRankedPhoto {
+  fileInstanceId: number;
+  contentAssetId: number;
+  path: string;
+  extension: string;
+  formatName: string | null;
+  width: number | null;
+  height: number | null;
+  qualityScore: number | null;
+  previewSupported: boolean;
+  thumbnailPath: string | null;
+  userRating: number | null;
+  rankPosition: number;
+  percentile: number;
+  rankBucket: "top" | "mid" | "back";
+  uncertaintyBucket: "high" | "medium" | "low";
+  scoreGap: number;
+}
+
+export interface AiRankedPhotoPage {
+  items: AiRankedPhoto[];
+  total: number;
+}
+
+export interface ClassifyPhotoPage {
+  photos: ClassifyPhoto[];
+  total: number;
+}
